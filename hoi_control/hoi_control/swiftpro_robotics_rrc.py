@@ -155,6 +155,109 @@ def swiftpro_fk_with_tf_transform(q, tf_buffer=None, source_frame='world_ned', t
 # Geometric Forward Kinematics
 # ---------------------------------------------------------------------------
 
+# 3-DOF Geometric Jacobian with TF Buffer Transform
+def swiftpro_jacobian_with_tf_transform(q, tf_buffer=None, source_frame='world_ned', target_frame='world_enu'):
+    """
+    Compute the 3-DOF position Jacobian by calculating in NED frame, then
+    transforming to target frame using TF buffer or fallback rotation.
+    
+    This function mirrors swiftpro_fk_with_tf_transform: it computes the Jacobian
+    in NED frame, then applies the frame transformation via TF or manual rotation.
+    
+    Mathematical basis:
+    If p_target = R @ p_ned (position transform), then:
+        J_target = R @ J_ned (velocity/Jacobian transform)
+    
+    Arguments
+    ---------
+    q : array-like, shape (3,) or (4,) - only first 3 elements used.
+    
+    tf_buffer : tf2_ros.Buffer, optional
+        TF buffer containing the transform between source and target frames.
+        If None, falls back to manual NED→ENU rotation.
+    
+    source_frame : str
+        Source coordinate frame (default: 'world_ned')
+    
+    target_frame : str
+        Target coordinate frame (default: 'world_enu')
+
+    Returns
+    -------
+    J : np.ndarray, shape (3, 3)
+        Rows → [dx, dy, dz] in target_frame-aligned axes.
+        Columns → [dq1, dq2, dq3].
+    """
+    q1, q2, q3 = float(q[0]), float(q[1]), float(q[2])
+
+    # Compute Jacobian in NED frame using q1_eff = q1 - π
+    # (matching swiftpro_fk_with_tf_transform convention)
+    q1_eff = q1 - np.pi
+    s1_ned, c1_ned = np.sin(q1_eff), np.cos(q1_eff)
+
+    s2, c2 = np.sin(q2), np.cos(q2)
+    s3, c3 = np.sin(q3), np.cos(q3)
+
+    r      = 0.0127 - L2 * s2 + L3 * c3   # reach to link8A
+    r_ee   = r + L_J4                       # total reach including joint4 offset
+
+    # Derivatives of r_ee and z_ee with respect to joint angles
+    dr_ee_dq2 = -L2 * c2
+    dr_ee_dq3 = -L3 * s3
+    dz_ee_dq2 = -L2 * s2
+    dz_ee_dq3 =  L3 * c3
+
+    # Construct NED Jacobian:
+    # ───────────────────────
+    # x_ned = r_ee * cos(q1_eff)
+    # y_ned = r_ee * sin(q1_eff)
+    # z_ned = -z_ee
+    J_ned = np.array([
+        # ∂x_ned/∂qi:
+        [ -r_ee * s1_ned,    c1_ned * dr_ee_dq2,    c1_ned * dr_ee_dq3 ],
+        # ∂y_ned/∂qi:
+        [  r_ee * c1_ned,    s1_ned * dr_ee_dq2,    s1_ned * dr_ee_dq3 ],
+        # ∂z_ned/∂qi: (z_ned = -z_ee, so ∂z_ned/∂qi = -∂z_ee/∂qi)
+        [  0.0,             -dz_ee_dq2,             -dz_ee_dq3         ],
+    ])
+
+    # Transform Jacobian from NED to target frame
+    if tf_buffer is not None and TF_AVAILABLE:
+        try:
+            transform = tf_buffer.lookup_transform(
+                target_frame, 
+                source_frame, 
+                rclpy.time.Time()
+            )
+            
+            # Extract rotation matrix from the quaternion
+            quat = transform.transform.rotation
+            q_array = [quat.x, quat.y, quat.z, quat.w]
+            transform_matrix = quaternion_matrix(q_array)
+            rotation_matrix = transform_matrix[:3, :3]
+            
+        except Exception as e:
+            # If lookup fails, use fallback rotation
+            print(f"TF lookup failed: {e}. Using fallback rotation for Jacobian.")
+            rotation_matrix = np.array([
+                [1.0,  0.0,   0.0],
+                [0.0, -1.0,   0.0],
+                [0.0,  0.0,  -1.0],
+            ])
+    else:
+        # Fallback: NED to ENU rotation (180° around x-axis)
+        rotation_matrix = np.array([
+            [1.0,  0.0,   0.0],
+            [0.0, -1.0,   0.0],
+            [0.0,  0.0,  -1.0],
+        ])
+
+    # Apply rotation: J_target = R @ J_ned
+    J_target = rotation_matrix @ J_ned
+
+    return J_target
+
+
 def swiftpro_fk(q):
     """
     Arguments
@@ -250,7 +353,7 @@ def swiftpro_jacobian(q):
 
 
 # 4-DOF Jacobians  (include joint4 EE yaw)
-def swiftpro_jacobian_pos4(q):
+def swiftpro_jacobian_pos4(q, tf_buffer=None):
     """
     Arguments
     ---------
@@ -261,7 +364,8 @@ def swiftpro_jacobian_pos4(q):
     J : np.ndarray, shape (3, 4)
     """
     q1, q4 = float(q[0]), float(q[3])
-    J3 = swiftpro_jacobian(q)   # (3, 3) — first three columns
+    # J3 = swiftpro_jacobian(q)   # (3, 3) — first three columns
+    J3 = swiftpro_jacobian_with_tf_transform(q, tf_buffer=tf_buffer)   # (3, 3) — first three columns
 
     # 4th column: EE position sensitivity to q4
     # With L_EE_TOOL=0 this is [0,0,0]; non-zero only if a tool is mounted.

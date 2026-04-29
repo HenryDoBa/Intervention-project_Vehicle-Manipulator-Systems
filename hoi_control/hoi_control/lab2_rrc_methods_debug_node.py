@@ -407,7 +407,7 @@ class Lab2RRCMethodsDebugNode(Node):
             # no moment arm to the EE when L_EE_TOOL = 0), so q4 naturally receives
             # dq4 = 0 — it is left uncontrolled until orientation mode is enabled.
             err = pos_err                              # shape (3, 1)
-            J   = swiftpro_jacobian_pos4(self.arm.q)  # shape (3, 4)
+            J   = swiftpro_jacobian_pos4(self.arm.q, tf_buffer=self._tf_buffer)  # shape (3, 4)
             K   = np.diag([K_gain] * 3)               # shape (3, 3)
 
         # Condition number of the Jacobian: measures proximity to a singularity.
