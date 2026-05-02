@@ -14,6 +14,7 @@ install(PROGRAMS
   hoi_control/lab2_rrc_node.py
   hoi_control/lab2_rrc_debug_node.py
   hoi_control/lab2_rrc_methods_debug_node.py
+  hoi_control/lab2_rrc_methods_vms_node.py
   hoi_control/lab3_two_tasks_node.py
   hoi_control/lab3_null_space_node.py
   hoi_control/lab4_tp_node.py

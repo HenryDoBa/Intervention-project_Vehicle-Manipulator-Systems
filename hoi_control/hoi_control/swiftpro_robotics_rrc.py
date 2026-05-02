@@ -365,7 +365,8 @@ def swiftpro_jacobian_pos4(q, tf_buffer=None):
     """
     q1, q4 = float(q[0]), float(q[3])
     # J3 = swiftpro_jacobian(q)   # (3, 3) — first three columns
-    J3 = swiftpro_jacobian_with_tf_transform(q, tf_buffer=tf_buffer)   # (3, 3) — first three columns
+    # J3 = swiftpro_jacobian_with_tf_transform(q, tf_buffer=tf_buffer)   # (3, 3) — first three columns
+    J3 = swiftpro_jacobian(q)   # (3, 3) — correct Jacobian with pi/2 shift
 
     # 4th column: EE position sensitivity to q4
     # With L_EE_TOOL=0 this is [0,0,0]; non-zero only if a tool is mounted.
@@ -411,6 +412,91 @@ def swiftpro_jacobian_full4(q):
     yaw_row = np.array([[1.0, 0.0, 0.0, 1.0]])       # dyaw/d[q1,q2,q3,q4]
     return np.vstack([J_pos4, yaw_row])               # (4, 4)
 
+# 5-DOF VMS: Differential Drive Base (vx, vyaw) + 3-DOF Arm (q1, q2, q3)
+# State: q = [x, y, psi, q1, q2, q3] (position, yaw, arm angles)
+# Quasi-velocities: ζ = [vx, vyaw, dq1, dq2, dq3] (body-frame linear, yaw, joint vels)
+# Jacobian: 3×5 (EE position derivative w.r.t. 5 DOF)
+
+
+def swiftpro_fk_vms_5dof(j1_world, arm_q, base_yaw, tf_buffer):
+    """
+    EE position in world_enu for the VMS (Turtlebot + uArm Swift Pro).
+
+    swiftpro_fk() bakes in the calibration q1_eff = q1 − π/2, which makes it
+    correct only when the base is at the scenario initial yaw ψ_scenario = π/2.
+    For any base yaw ψ the correct EE-from-J1 vector in world_enu is:
+
+        x = −r_ee · cos(q1 − ψ)
+        y =  r_ee · sin(q1 − ψ)
+
+    Substituting q1_mod = q1 − (ψ − π/2) into swiftpro_fk gives:
+        q1_eff_mod = q1_mod − π/2 = q1 − ψ  ✓
+
+    No rotation matrix needed — the q1 substitution handles any base yaw.
+
+    Parameters
+    ----------
+    j1_world : (3,) J1 (link1) position in world_enu — from TF.
+    arm_q    : (3,) or (4,) arm joint angles [q1, q2, q3, ...].
+    base_yaw : current base yaw in world_enu (rad).
+
+    Returns
+    -------
+    p_ee : (3,) EE position in world_enu.
+    """
+    q_mod    = np.array(arm_q, dtype=float)
+    q_mod[0] -= (base_yaw)   # correct q1 for current base yaw
+    return np.asarray(j1_world, dtype=float) + swiftpro_fk_with_tf_transform(q_mod, tf_buffer=tf_buffer)
+
+def swiftpro_jacobian_vms_5dof(ee_world, base_world, base_yaw, arm_q, tf_buffer):
+    """
+    3×5 VMS position Jacobian in world_enu.
+
+    Maps quasi-velocities ζ = [vx, ω, dq1, dq2, dq3] → EE linear velocity.
+
+    Geometric column derivation (cf. jacobianLink in lab6_robotics.py):
+
+      col_vx  : body x-axis in world = [cos ψ, sin ψ, 0]ᵀ
+                Prismatic DOF: translating the base moves EE along heading.
+
+      col_ω   : z_B × (p_EE − p_BASE) = [−Δy, Δx, 0]ᵀ
+                Revolute DOF around body z.  Rotation centre = BASE centre
+                (base_footprint), NOT J1/link1.
+
+      col_dqi : swiftpro_jacobian evaluated at q1_mod = q1 − (ψ − π/2).
+                Same q1 substitution as swiftpro_fk_vms_5dof — gives the
+                correct partial derivatives in world_enu at current base yaw.
+                No Rz matrix needed.
+
+    Parameters
+    ----------
+    ee_world  : (3,) current EE position in world_enu (TF or FK).
+    base_world: (3,) or (2,) base centre (base_footprint) in world_enu.
+    base_yaw  : current base yaw in world_enu (rad).
+    arm_q     : (3,) or (4,) arm joint angles [q1, q2, q3, ...].
+
+    Returns
+    -------
+    J : (3, 5) Jacobian — columns [vx, ω, dq1, dq2, dq3].
+    """
+    bx, by = float(base_world[0]), float(base_world[1])
+    ex, ey = float(ee_world[0]),   float(ee_world[1])
+
+    # ── Column 0: vx (prismatic along body x-axis in world) ──────────────
+    col_vx = np.array([math.cos(base_yaw), math.sin(base_yaw), 0.0])
+
+    # ── Column 1: ω (revolute around body z at BASE centre) ──────────────
+    # jacobianLink pattern: col = z_B × (p_EE − p_B), z_B=[0,0,1]
+    col_omega = np.array([-(ey - by), (ex - bx), 0.0])
+
+    # ── Columns 2–4: arm joints ───────────────────────────────────────────
+    # Substitute q1_mod = q1 − (ψ − π/2) — same correction as FK.
+    # swiftpro_jacobian with q1_mod gives ∂p/∂qi in world_enu at current ψ.
+    q_mod    = np.array(arm_q, dtype=float)
+    q_mod[0] -= (base_yaw)
+    J_arm_world = swiftpro_jacobian_with_tf_transform(q_mod, tf_buffer=tf_buffer)  # (3, 3) correct at current ψ
+
+    return np.column_stack([col_vx, col_omega, J_arm_world])   # (3, 5)
 
 
 # Damped Least-Squares pseudo-inverse
