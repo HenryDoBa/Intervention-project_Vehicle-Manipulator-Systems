@@ -3,6 +3,11 @@
 # Learn more about .gitignore:
 #     https://www.atlassian.com/git/tutorials/saving-changes/gitignore
 
+# Folders after the build process
+build/
+install/
+log/
+
 # Node artifact files
 node_modules/
 dist/
