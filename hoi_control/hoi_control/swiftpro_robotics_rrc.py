@@ -412,6 +412,72 @@ def swiftpro_jacobian_full4(q):
     yaw_row = np.array([[1.0, 0.0, 0.0, 1.0]])       # dyaw/d[q1,q2,q3,q4]
     return np.vstack([J_pos4, yaw_row])               # (4, 4)
 
+
+def swiftpro_jacobian_pos4_with_tf_transform(q, tf_buffer=None, source_frame='world_ned', target_frame='world_enu'):
+    """
+    3×4 position Jacobian with TF frame transform, including q4 EE yaw column.
+
+    Mirrors swiftpro_jacobian_pos4 but uses swiftpro_jacobian_with_tf_transform
+    for the first three columns so the result is expressed in target_frame.
+
+    Arguments
+    ---------
+    q : array-like, shape (4,) – [q1, q2, q3, q4]
+    tf_buffer : tf2_ros.Buffer, optional
+    source_frame : str  (default: 'world_ned')
+    target_frame : str  (default: 'world_enu')
+
+    Returns
+    -------
+    J : np.ndarray, shape (3, 4)
+    """
+    q1, q4 = float(q[0]), float(q[3])
+    J3 = swiftpro_jacobian_with_tf_transform(q, tf_buffer=tf_buffer,
+                                              source_frame=source_frame,
+                                              target_frame=target_frame)  # (3, 3)
+
+    # 4th column: zero when L_EE_TOOL=0 (q4 is pure orientation, no positional effect)
+    angle_j4 = q1 + q4
+    col4 = np.array([
+        L_EE_TOOL * np.sin(angle_j4),
+        L_EE_TOOL * np.cos(angle_j4),
+        0.0
+    ])
+
+    return np.hstack([J3, col4.reshape(3, 1)])   # (3, 4)
+
+
+def swiftpro_jacobian_full4_with_tf_transform(q, tf_buffer=None, source_frame='world_ned', target_frame='world_enu'):
+    """
+    4×4 full Jacobian with TF frame transform mapping [dq1, dq2, dq3, dq4] → [dx, dy, dz, d(yaw)].
+
+    Use this for combined position + EE yaw control when the NED→ENU (or any
+    custom) frame transform must be applied via TF.
+
+    The yaw row [1, 0, 0, 1] is frame-independent: EE yaw = q1 + q4 is a
+    kinematic identity that holds regardless of coordinate frame.
+
+    When using this Jacobian the error vector must be 4×1: [ex, ey, ez, e_yaw].
+    Always wrap e_yaw to [−π, π] before use.
+
+    Arguments
+    ---------
+    q : array-like, shape (4,)
+    tf_buffer : tf2_ros.Buffer, optional
+    source_frame : str  (default: 'world_ned')
+    target_frame : str  (default: 'world_enu')
+
+    Returns
+    -------
+    J : np.ndarray, shape (4, 4)
+    """
+    J_pos4  = swiftpro_jacobian_pos4_with_tf_transform(q, tf_buffer=tf_buffer,
+                                                        source_frame=source_frame,
+                                                        target_frame=target_frame)  # (3, 4)
+    yaw_row = np.array([[1.0, 0.0, 0.0, 1.0]])       # dyaw/d[q1,q2,q3,q4]
+    return np.vstack([J_pos4, yaw_row])               # (4, 4)
+
+
 # 5-DOF VMS: Differential Drive Base (vx, vyaw) + 3-DOF Arm (q1, q2, q3)
 # State: q = [x, y, psi, q1, q2, q3] (position, yaw, arm angles)
 # Quasi-velocities: ζ = [vx, vyaw, dq1, dq2, dq3] (body-frame linear, yaw, joint vels)
@@ -497,6 +563,28 @@ def swiftpro_jacobian_vms_5dof(ee_world, base_world, base_yaw, arm_q, tf_buffer)
     J_arm_world = swiftpro_jacobian_with_tf_transform(q_mod, tf_buffer=tf_buffer)  # (3, 3) correct at current ψ
 
     return np.column_stack([col_vx, col_omega, J_arm_world])   # (3, 5)
+
+
+def swiftpro_jacobian_vms_6dof(ee_world, base_world, base_yaw, arm_q, tf_buffer):
+    """
+    4×6 VMS Jacobian for combined position + EE yaw control.
+
+    Extends swiftpro_jacobian_vms_6dof by adding a q4 column and a yaw row.
+
+    ζ = [vx, ω, dq1, dq2, dq3, dq4] → [dx, dy, dz, d(yaw)]
+
+    q4 position column: [0, 0, 0]ᵀ  (L_EE_TOOL = 0, pure orientation DOF)
+
+    Yaw row derivation:
+        EE yaw in world_enu = base_yaw + q1 + q4
+        d(yaw)/d[vx, ω, dq1, dq2, dq3, dq4] = [0, 1, 1, 0, 0, 1]
+    """
+    J_pos5 = swiftpro_jacobian_vms_5dof(
+        ee_world, base_world, base_yaw, arm_q, tf_buffer)       # (3, 5)
+
+    J_pos6  = np.hstack([J_pos5, np.zeros((3, 1))])             # (3, 6)  q4 col = 0
+    yaw_row = np.array([[0.0, 1.0, 1.0, 0.0, 0.0, 1.0]])       # (1, 6)
+    return np.vstack([J_pos6, yaw_row])                         # (4, 6)
 
 
 # Damped Least-Squares pseudo-inverse
@@ -661,3 +749,346 @@ class SwiftProManipulator4DOF:
         axes.  Use for combined position + EE yaw control tasks.
         """
         return swiftpro_jacobian_full4(self.q)
+
+
+# ===========================================================================
+#  Task-Priority Control for VMS (Turtlebot + SwiftPro)
+#
+#  Quasi-velocity space: ζ = [vx, ω, dq1, dq2, dq3, dq4]  (6 DOF)
+#
+#  Joint index mapping used by VMSJointLimitsTask:
+#    0 = vx   (base linear, no joint limit)
+#    1 = ω    (base yaw rate / psi)
+#    2 = q1   (arm base yaw)
+#    3 = q2   (arm shoulder)
+#    4 = q3   (arm elbow)
+#    5 = q4   (EE yaw)
+# ===========================================================================
+
+class VMSRobotState:
+    """
+    Lightweight state container for VMS task-priority control.
+
+    Call update() each control tick before calling vms_task_priority_step().
+    All Task subclasses below use this interface instead of a full robot model.
+    """
+    DOF = 6
+
+    def __init__(self):
+        self.ee_world  = np.zeros(3)
+        self.base_pos  = np.zeros(2)
+        self.base_psi  = 0.0
+        self.arm_q     = np.zeros(4)   # [q1, q2, q3, q4]
+        self.tf_buffer = None
+
+    def update(self, ee_world, base_pos, base_psi, arm_q, tf_buffer=None):
+        self.ee_world  = np.asarray(ee_world, dtype=float)
+        self.base_pos  = np.asarray(base_pos, dtype=float)[:2]
+        self.base_psi  = float(base_psi)
+        self.arm_q     = np.asarray(arm_q,    dtype=float)
+        self.tf_buffer = tf_buffer
+
+    def getDOF(self):
+        return self.DOF
+
+    def getEEPosition(self):
+        return self.ee_world.copy()
+
+    def getEEYaw(self):
+        return self.base_psi + self.arm_q[0] + self.arm_q[3]
+
+    def getEEJacobian(self):
+        """3×6 position Jacobian — top 3 rows of the full 4×6 Jacobian."""
+        return self._jacobian6()[:3, :]
+
+    def getFullJacobian(self):
+        """4×6 configuration Jacobian [position; yaw row]."""
+        return self._jacobian6()
+
+    def getJointPos(self, idx):
+        """
+        Returns the position of the DOF at quasi-velocity index idx.
+          idx=1  → base_psi
+          idx=2  → q1,  idx=3 → q2,  idx=4 → q3,  idx=5 → q4
+        """
+        if idx == 1:
+            return self.base_psi
+        elif 2 <= idx <= 5:
+            return float(self.arm_q[idx - 2])
+        return 0.0
+
+    def _jacobian6(self):
+        bw = np.array([self.base_pos[0], self.base_pos[1], 0.0])
+        return swiftpro_jacobian_vms_6dof(
+            self.ee_world, bw, self.base_psi, self.arm_q, self.tf_buffer)
+
+
+# ---------------------------------------------------------------------------
+#  Task base class
+# ---------------------------------------------------------------------------
+
+class Task:
+    """Abstract base — same interface as swiftpro_robotics.Task."""
+    def __init__(self, name, desired):
+        self.name    = name
+        self.sigma_d = np.asarray(desired, dtype=float)
+        self.ff_vel  = np.zeros_like(self.sigma_d)
+        self.K       = np.eye(self.sigma_d.shape[0])
+        self.J       = None
+        self.err     = None
+
+    def update(self, _):        pass
+    def setDesired(self, v):    self.sigma_d = np.asarray(v, dtype=float)
+    def getDesired(self):       return self.sigma_d
+    def getJacobian(self):      return self.J
+    def getError(self):         return self.err
+    def setFF(self, v):         self.ff_vel = np.asarray(v, dtype=float)
+    def getFF(self):            return self.ff_vel
+    def setGain(self, K):       self.K = K
+    def getGain(self):          return self.K
+    def isActive(self):         return True
+
+
+# ---------------------------------------------------------------------------
+#  Task subclasses for VMS
+# ---------------------------------------------------------------------------
+
+class VMSPositionTask(Task):
+    """
+    3-D EE position task in world_enu.
+    Jacobian: 3×6 (position rows of swiftpro_jacobian_vms_6dof).
+    desired: shape (3,1) — [px, py, pz]
+    """
+    def __init__(self, name, desired_pos):
+        super().__init__(name, np.asarray(desired_pos, dtype=float).reshape(3, 1))
+        self.J   = np.zeros((3, 6))
+        self.err = np.zeros((3, 1))
+
+    def update(self, state):
+        p        = state.getEEPosition().reshape(3, 1)
+        self.err = self.sigma_d - p
+        self.J   = state.getEEJacobian()   # 3×6
+
+
+class VMSYawTask(Task):
+    """
+    EE yaw task: σ = psi + q1 + q4.
+    Jacobian row: [0, 1, 1, 0, 0, 1]  (1×6).
+    desired: scalar yaw (rad)
+    """
+    def __init__(self, name, desired_yaw):
+        super().__init__(name, np.array([[float(desired_yaw)]]))
+        self.J   = np.zeros((1, 6))
+        self.err = np.zeros((1, 1))
+
+    def update(self, state):
+        raw_err = float(self.sigma_d[0, 0]) - state.getEEYaw()
+        raw_err = (raw_err + np.pi) % (2 * np.pi) - np.pi
+        self.err = np.array([[raw_err]])
+        self.J   = np.array([[0., 1., 1., 0., 0., 1.]])
+
+
+class VMSConfigurationTask(Task):
+    """
+    Combined 3-D position + yaw task.
+    Jacobian: 4×6 (full swiftpro_jacobian_vms_6dof).
+    desired: shape (4,1) — [px, py, pz, yaw]
+    """
+    def __init__(self, name, desired):
+        super().__init__(name, np.asarray(desired, dtype=float).reshape(4, 1))
+        self.J   = np.zeros((4, 6))
+        self.err = np.zeros((4, 1))
+
+    def update(self, state):
+        p       = state.getEEPosition().reshape(3, 1)
+        pos_err = self.sigma_d[:3] - p
+
+        raw_yaw_err = float(self.sigma_d[3, 0]) - state.getEEYaw()
+        raw_yaw_err = (raw_yaw_err + np.pi) % (2 * np.pi) - np.pi
+
+        self.err = np.vstack([pos_err, [[raw_yaw_err]]])
+        self.J   = state.getFullJacobian()   # 4×6
+
+
+class VMSJointLimitsTask(Task):
+    """
+    Joint limit avoidance for a single DOF in the 6-DOF quasi-velocity space.
+    Activates when the joint enters the margin zone near a hard limit and
+    commands a velocity that pushes it back toward the safe region.
+
+    joint_idx: quasi-velocity index (2=q1, 3=q2, 4=q3, 5=q4)
+    q_min/q_max: URDF hard limits
+    margin: activation zone inside the hard limit (rad)
+    """
+    def __init__(self, name, joint_idx, q_min, q_max, margin=0.07, hysteresis_ratio=3.0):
+        super().__init__(name, np.zeros((1, 1)))
+        self.joint_idx        = joint_idx
+        self.q_min            = q_min
+        self.q_max            = q_max
+        self.margin           = margin
+        self.hysteresis_ratio = hysteresis_ratio  # δ = margin * ratio
+        self._active    = False
+        self._direction = 0
+        self.current_q  = 0.0
+        self.J   = np.zeros((1, 6))
+        self.err = np.zeros((1, 1))
+
+    def update(self, state):
+        self.current_q = state.getJointPos(self.joint_idx)
+
+        # alpha = margin (activation threshold)
+        # delta = margin * hysteresis_ratio (deactivation threshold, ratio > 1 avoids chatter)
+        delta = self.margin * self.hysteresis_ratio
+
+        if not self._active:
+            # Activate when joint enters the danger zone near a limit
+            if self.current_q >= self.q_max - self.margin:
+                self._direction = -1
+                self._active    = True
+            elif self.current_q <= self.q_min + self.margin:
+                self._direction =  1
+                self._active    = True
+        else:
+            # Deactivate only on the side that triggered (direction-specific, per slide)
+            if self._direction == -1 and self.current_q <= self.q_max - delta:
+                self._active    = False
+                self._direction = 0
+            elif self._direction == 1 and self.current_q >= self.q_min + delta:
+                self._active    = False
+                self._direction = 0
+
+        if self._active:
+            self.err = np.array([[float(self._direction)]])
+            self.J   = np.zeros((1, 6))
+            self.J[0, self.joint_idx] = 1.0
+        else:
+            self.err = np.array([[0.0]])
+            self.J   = np.zeros((1, 6))
+
+    def isActive(self):         return self._active
+    def getCurrentPosition(self): return self.current_q
+
+
+class VMSJointCenteringTask(Task):
+    """
+    Lowest-priority task: attract all arm joints toward their midpoints.
+
+    In the null-space of every higher-priority task the solver uses this to
+    gently re-center q1-q4. This prevents the configuration reached at goal N
+    from being a bad starting point for goal N+1 — a pure reactive controller
+    would otherwise be path-dependent because it has no memory or planning.
+
+    Jacobian: 4×6, identity columns for [dq1, dq2, dq3, dq4] (indices 2-5).
+    Error: q_center - q_current for each arm joint.
+    """
+    def __init__(self, name, q_centers):
+        super().__init__(name, np.array(q_centers, dtype=float).reshape(4, 1))
+        self.J   = np.zeros((4, 6))
+        self.J[0, 2] = 1.0   # dq1
+        self.J[1, 3] = 1.0   # dq2
+        self.J[2, 4] = 1.0   # dq3
+        self.J[3, 5] = 1.0   # dq4
+        self.err = np.zeros((4, 1))
+
+    def update(self, state):
+        self.err = self.sigma_d - state.arm_q.reshape(4, 1)
+
+
+class VMSQ4ZeroTask(Task):
+    """
+    Drive q4 directly to zero.
+
+    Error:    0 − q4_current  (direct joint error, not EE yaw error)
+    Jacobian: [0, 0, 0, 0, 0, 1]  — only dq4.
+
+    Use this after VMSYawQ4Task has finished so the suction-cup yaw joint
+    is returned to its neutral position before the next goal starts.
+    Base and arm joints q1-q3 are untouched.
+    """
+    def __init__(self):
+        super().__init__('q4_zero', np.zeros((1, 1)))
+        self.J   = np.zeros((1, 6))
+        self.J[0, 5] = 1.0   # dq4
+        self.err = np.zeros((1, 1))
+
+    def update(self, state):
+        self.err = np.array([[-float(state.arm_q[3])]])   # 0 − q4_current
+
+
+class VMSYawQ4Task(Task):
+    """
+    EE yaw task using ONLY q4 (joint4 = EE yaw joint, index 5 in dzeta).
+
+    Run this AFTER the position task has converged. Because L_EE_TOOL = 0,
+    q4 contributes [0, 0, 0] to EE position, so this task has exactly zero
+    coupling with any position DOF. The base (vx, ω) and arm joints q1-q3
+    are never touched.
+
+    Jacobian row: [0, 0, 0, 0, 0, 1]  — only dq4.
+    Error: wrap(target_yaw − (psi + q1 + q4)).
+
+    Limitation: q4 ∈ [−π/2, π/2], so the achievable yaw offset from the
+    current (psi + q1) is at most ±1.57 rad. Check that
+    |target_yaw − psi_final − q1_final| < Q4_MAX before relying on this.
+    """
+    def __init__(self, name, desired_yaw=0.0):
+        super().__init__(name, np.array([[float(desired_yaw)]]))
+        self.J   = np.zeros((1, 6))
+        self.J[0, 5] = 1.0   # index 5 = dq4
+        self.err = np.zeros((1, 1))
+
+    def update(self, state):
+        raw_err = float(self.sigma_d[0, 0]) - state.getEEYaw()
+        raw_err = (raw_err + np.pi) % (2 * np.pi) - np.pi
+        self.err = np.array([[raw_err]])
+        # Jacobian is constant — only q4
+
+
+# ---------------------------------------------------------------------------
+#  Recursive Task-Priority solver for VMS
+# ---------------------------------------------------------------------------
+
+def vms_task_priority_step(tasks, state, damping=0.1):
+    """
+    One step of the recursive Task-Priority algorithm for the VMS.
+
+    Processes tasks from highest to lowest priority.  Each task operates
+    in the null-space of all higher-priority tasks, so higher-priority tasks
+    are never disturbed by lower-priority ones.
+
+    Arguments
+    ---------
+    tasks   : list[Task]       — ordered highest → lowest priority
+    state   : VMSRobotState    — current robot state (call update() first)
+    damping : float            — DLS λ (higher = more stable near singularities)
+
+    Returns
+    -------
+    zeta : np.ndarray, shape (6,1)
+        Joint velocity command [vx, ω, dq1, dq2, dq3, dq4].
+    """
+    n    = state.getDOF()   # 6
+    P    = np.eye(n)
+    zeta = np.zeros((n, 1))
+
+    for task in tasks:
+        task.update(state)
+
+        if not task.isActive():
+            continue
+
+        err_i  = task.getError()
+        Ji     = task.getJacobian()
+        Ki     = task.getGain()
+        ff_i   = task.getFF()
+        xi_dot = Ki @ err_i + ff_i
+
+        Ji_bar     = Ji @ P
+        Ji_bar_dls = DLS(Ji_bar, damping)
+
+        zeta = zeta + Ji_bar_dls @ (xi_dot - Ji @ zeta)
+
+        Ji_bar_pinv = np.linalg.pinv(Ji_bar)
+        P = P - Ji_bar_pinv @ Ji_bar
+
+    return zeta

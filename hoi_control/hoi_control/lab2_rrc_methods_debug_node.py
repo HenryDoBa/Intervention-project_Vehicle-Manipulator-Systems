@@ -39,8 +39,10 @@ from hoi_control.swiftpro_robotics_rrc import (
     swiftpro_fk,
     swiftpro_fk_with_tf_transform,                  # geometric FK: q -> [x, y, z] in arm-local ENU
     swiftpro_jacobian,            # 3x3 position Jacobian (3-DOF, used for FK comparison)
-    swiftpro_jacobian_pos4,       # 3x4 position Jacobian (4-DOF, q4 col = [0,0,0])
-    swiftpro_jacobian_full4,      # 4x4 position + EE-yaw Jacobian (orientation mode)
+    # swiftpro_jacobian_pos4,     # replaced by TF-transform version below
+    # swiftpro_jacobian_full4,    # replaced by TF-transform version below
+    swiftpro_jacobian_pos4_with_tf_transform,   # 3x4 position Jacobian with NED->ENU TF transform
+    swiftpro_jacobian_full4_with_tf_transform,  # 4x4 position+yaw Jacobian with NED->ENU TF transform
     DLS,                          # Damped Least-Squares pseudo-inverse
     scale_velocities,             # uniform velocity scaling to stay within max_vel
     Q1_MIN, Q1_MAX,               # joint1 base yaw URDF limits  (+-pi/2)
@@ -94,13 +96,16 @@ ID_TEXT     = 5   # WHITE  text    — method name, error magnitude, and goal in
 # when the Turtlebot base is at the origin.
 # The node cycles through these goals in order every `goal_cycle_period`
 # seconds (default 30 s), demonstrating each RRC method on varied targets.
+# Each goal is (position_world_enu, target_yaw).
+# target_yaw = float('nan') -> position-only mode (3x4 Jacobian, q4 uncontrolled).
+# target_yaw = finite value  -> orientation mode  (4x4 Jacobian, yaw is controlled).
 GOAL_SEQUENCE = [
-    np.array([-0.25,  0.00,  0.30]),   
-    np.array([ 0.00,  -0.25,  0.35]),   
-    np.array([-0.15,  -0.15,  0.28]),   
-    np.array([0.10,  0.00,  0.40]),   
-    np.array([ 0.00,  -0.25,  0.30]),   
-    np.array([-0.20,  -0.10,  0.36]),   
+    (np.array([-0.25,  0.00,  0.30]), float('nan')),  # position-only
+    (np.array([ 0.00, -0.25,  0.35]),  0.5),           # EE yaw = +0.5 rad (~29 deg)
+    (np.array([-0.15, -0.15,  0.28]), float('nan')),  # position-only
+    (np.array([ 0.10,  0.00,  0.40]), -0.5),           # EE yaw = -0.5 rad (~-29 deg)
+    (np.array([ 0.00, -0.25,  0.30]),  0.0),           # EE yaw =  0.0 rad (neutral)
+    (np.array([-0.20, -0.10,  0.36]),  1.0),           # EE yaw = +1.0 rad (~57 deg)
 ]
 
 # How long (seconds) the arm tries to reach each goal before cycling to the next
@@ -262,20 +267,23 @@ class Lab2RRCMethodsDebugNode(Node):
         # Advance goal index, wrapping back to 0 after the last goal
         self._goal_idx = (self._goal_idx + 1) % len(GOAL_SEQUENCE)
 
-        # Retrieve the next goal position from the sequence
-        goal = GOAL_SEQUENCE[self._goal_idx]
+        # Retrieve the next goal from the sequence (position + yaw)
+        goal_pos, goal_yaw = GOAL_SEQUENCE[self._goal_idx]
 
         # Write the new target back into the ROS parameter server
         self.set_parameters([
-            Parameter('target_x', Parameter.Type.DOUBLE, float(goal[0])),  
-            Parameter('target_y', Parameter.Type.DOUBLE, float(goal[1])),  
-            Parameter('target_z', Parameter.Type.DOUBLE, float(goal[2])),  
+            Parameter('target_x',   Parameter.Type.DOUBLE, float(goal_pos[0])),
+            Parameter('target_y',   Parameter.Type.DOUBLE, float(goal_pos[1])),
+            Parameter('target_z',   Parameter.Type.DOUBLE, float(goal_pos[2])),
+            Parameter('target_yaw', Parameter.Type.DOUBLE, float(goal_yaw)),
         ])
 
-        # Inform which goal is now active
+        yaw_str = f'{goal_yaw:.2f} rad ({math.degrees(goal_yaw):.1f} deg)' \
+                  if math.isfinite(goal_yaw) else 'position-only'
         self.get_logger().info(
             f'[GOAL CYCLE] -> goal {self._goal_idx}/{len(GOAL_SEQUENCE)-1}: '
-            f'[{goal[0]:.3f}, {goal[1]:.3f}, {goal[2]:.3f}] world_enu')
+            f'[{goal_pos[0]:.3f}, {goal_pos[1]:.3f}, {goal_pos[2]:.3f}] world_enu  '
+            f'yaw={yaw_str}')
 
     def _control_loop(self):
         # Block until the first /joint_states message has been received.
@@ -378,7 +386,11 @@ class Lab2RRCMethodsDebugNode(Node):
             self.get_logger().warn('TF unavailable — using FK for error',
                                    throttle_duration_sec=1.0)
 
-        # Build Jacobian and error vector 
+        # Initialise yaw_err so it is always defined for logging below.
+        # Overwritten inside the orient_mode branch when a yaw target is active.
+        yaw_err = float('nan')
+
+        # Build Jacobian and error vector
         if orient_mode:
             # Orientation + position mode (4x4 Jacobian)
             # Retrieve the current combined EE yaw: yaw = q1 + q4
@@ -395,7 +407,9 @@ class Lab2RRCMethodsDebugNode(Node):
             err = np.vstack([pos_err, [[yaw_err]]])    # shape (4, 1)
 
             # 4x4 Jacobian: rows = [dx, dy, dz, d(yaw)], cols = [q1, q2, q3, q4]
-            J = swiftpro_jacobian_full4(self.arm.q)    # shape (4, 4)
+            # J = swiftpro_jacobian_full4(self.arm.q)                               # no TF transform
+            J = swiftpro_jacobian_full4_with_tf_transform(                          # shape (4, 4)
+                    self.arm.q, tf_buffer=self._tf_buffer)
 
             # Diagonal gain matrix: same scalar gain on all four error dimensions
             K = np.diag([K_gain] * 4)                 # shape (4, 4)
@@ -407,7 +421,9 @@ class Lab2RRCMethodsDebugNode(Node):
             # no moment arm to the EE when L_EE_TOOL = 0), so q4 naturally receives
             # dq4 = 0 — it is left uncontrolled until orientation mode is enabled.
             err = pos_err                              # shape (3, 1)
-            J   = swiftpro_jacobian_pos4(self.arm.q, tf_buffer=self._tf_buffer)  # shape (3, 4)
+            # J   = swiftpro_jacobian_pos4(self.arm.q, tf_buffer=self._tf_buffer)  # no TF transform
+            J   = swiftpro_jacobian_pos4_with_tf_transform(                        # shape (3, 4)
+                    self.arm.q, tf_buffer=self._tf_buffer)
             K   = np.diag([K_gain] * 3)               # shape (3, 3)
 
         # Condition number of the Jacobian: measures proximity to a singularity.
@@ -510,33 +526,47 @@ class Lab2RRCMethodsDebugNode(Node):
             mode_str = (f'orient(target_yaw={t_yaw:.2f}rad)'
                         if orient_mode else 'position-only')
 
+            # Build orientation status string — only shown when a yaw target is active
+            if orient_mode and math.isfinite(yaw_err):
+                yaw_ok = abs(yaw_err) < 0.05   # ~3 deg
+                pos_ok = err_norm < 0.01        # 1 cm
+                if pos_ok and yaw_ok:
+                    orient_status = 'ACHIEVED (pos + yaw)'
+                elif yaw_ok:
+                    orient_status = 'YAW OK — pos converging'
+                elif pos_ok:
+                    orient_status = 'POS OK — yaw converging'
+                else:
+                    orient_status = 'converging...'
+                orient_lines = (
+                    f'  yaw target  : {t_yaw:.3f} rad  ({math.degrees(t_yaw):.1f} deg)\n'
+                    f'  yaw current : {self.arm.getEEYaw():.3f} rad  '
+                    f'(q1={q[0]:.3f} + q4={q[3]:.3f})\n'
+                    f'  yaw_err     : {math.degrees(yaw_err):.2f} deg  ({yaw_err:.4f} rad)\n'
+                    f'  orient status: {orient_status}\n'
+                )
+            else:
+                orient_lines = ''
+
             self.get_logger().info(
                 f'\n{"─"*60}\n'
                 f'  method      : {method_name}  |  enabled: {ena}  |  mode: {mode_str}\n'
                 f'  goal_idx    : {self._goal_idx}/{len(GOAL_SEQUENCE)-1}'
                 f'  (auto_cycle={self.get_parameter("goal_auto_cycle").value})\n'
                 f'  q           : [{q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f}] rad\n'
-                # Target in world_enu (what was commanded)
                 f'  target(wenu): [{tx:.3f}, {ty:.3f}, {tz:.3f}]\n'
-                # TF ground-truth EE position (what the sim reports)
                 f'  TF EE(wenu) : {np.round(ee_world_enu,3) if ee_world_enu is not None else "N/A"}\n'
-                # FK-predicted EE position (what our model thinks)
                 f'  FK EE(wenu) : {np.round(fk_world_enu,3)}\n'
-                # Discrepancy between FK and TF; should stay below ~20 mm for good control
                 f'  FK_vs_TF    : {fk_vs_tf_mm:.3f} mm  (<20 mm = good FK accuracy)\n'
-                # Which source was used for the error vector this tick
                 f'  pos_source  : {position_source}\n'
-                # Euclidean distance from EE to target (the quantity being minimised)
-                    f'  err_norm    : {err_norm:.4f} m\n'
-                    # Individual x/y/z components of the position error
+                f'  err_norm    : {err_norm:.4f} m\n'
                 f'  err_vec     : {np.round(pos_err.flatten(),4)}\n'
-                # Joint velocity command sent this tick
+                + orient_lines +
                 f'  dq[1-4]     : {np.round(dq_arr,4)}\n'
                 f'  J_cond      : {J_cond:.1f}  (>100 = near singularity)\n'
-                # Key tuning parameters echoed for reference
                 f'  params      : K={K_gain}  mv={mv}  dam={dam}\n'
-                f'  J1_world_enu      : {self._j1_world_enu[0]:.3f}, {self._j1_world_enu[1]:.3f}, {self._j1_world_enu[2]:.3f}\n'
-                f' fk_arm_enu      : {fk_arm_enu[0]:.3f}, {fk_arm_enu[1]:.3f}, {fk_arm_enu[2]:.3f}\n'
+                f'  J1_world_enu: {self._j1_world_enu[0]:.3f}, {self._j1_world_enu[1]:.3f}, {self._j1_world_enu[2]:.3f}\n'
+                f'  fk_arm_enu  : {fk_arm_enu[0]:.3f}, {fk_arm_enu[1]:.3f}, {fk_arm_enu[2]:.3f}\n'
                 f'{"─"*60}'
             )
 
@@ -545,11 +575,11 @@ class Lab2RRCMethodsDebugNode(Node):
         # visualisation stays in sync with the control state
         self._publish_markers(
             target_world_enu, ee_world_enu, fk_world_enu,
-            self._j1_world_enu, err_norm, method_name)
+            self._j1_world_enu, err_norm, method_name, yaw_err)
 
-    # Marker publisher 
+    # Marker publisher
 
-    def _publish_markers(self, target, tf_ee, fk_ee, j1, err_norm, method):
+    def _publish_markers(self, target, tf_ee, fk_ee, j1, err_norm, method, yaw_err=float('nan')):
         """
         Publish 6 RViz markers (same set as lab2_rrc_debug_node.py):
           RED    sphere  — target position
@@ -641,7 +671,12 @@ class Lab2RRCMethodsDebugNode(Node):
         mt.pose.position.z = float(target[2]) + 0.06   # offset above the target sphere
         mt.scale.z = 0.025    # text height in metres (scale.z controls font size for text markers)
         mt.color.r = mt.color.g = mt.color.b = mt.color.a = 1.0   # fully opaque white
-        mt.text = f'[{method}] err={err_norm:.3f}m  goal{self._goal_idx}'
+        t_yaw_cur = self.get_parameter('target_yaw').value
+        if math.isfinite(t_yaw_cur) and math.isfinite(yaw_err):
+            mt.text = (f'[{method}] err={err_norm:.3f}m  goal{self._goal_idx}\n'
+                       f'yaw_err={math.degrees(yaw_err):.1f}deg')
+        else:
+            mt.text = f'[{method}] err={err_norm:.3f}m  goal{self._goal_idx}'
         ma.markers.append(mt)
 
         # Publish all markers in a single message to minimise latency jitter
