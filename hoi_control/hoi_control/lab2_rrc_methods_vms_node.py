@@ -32,7 +32,8 @@ These are WORLD goals (not relative to arm), accounting for robot pose.
 
 
 import math
-
+import datetime
+import os
 
 import rclpy
 from rclpy.node import Node           
@@ -122,31 +123,21 @@ ID_TEXT     = 5   # WHITE  text    — method name, error magnitude, and goal in
 # Orient goals are split into 3 consecutive entries (position → yaw → Q4_RESET)
 # so position and yaw control never interfere with each other, and q4 is clean
 # for the next goal. 'Q4_RESET' drives q4 back to 0 using VMSQ4ZeroTask.
+# One entry per real goal. For orient goals (finite yaw), the code internally
+# runs three time-based sub-tasks sequentially: position → yaw(q4) → q4_reset.
+# Each sub-task runs for goal_cycle_period seconds. Position-only goals run
+# a single position task for one period.
 GOAL_SEQUENCE = [
     (np.array([ 1.20,  0.00,  0.30]), float('nan')),  # position-only
-
-    (np.array([ 0.00,  1.20,  0.35]), float('nan')),  # orient B — phase 1: position
-    (np.array([ 0.00,  1.20,  0.35]),  0.5),           # orient B — phase 2: q4 yaw = +0.5 rad
-    'Q4_RESET',                                         # orient B — phase 3: q4 → 0
-
+    (np.array([ 0.00,  1.20,  0.35]),  0.5),           # orient: q4 yaw = +0.5 rad
     (np.array([ 1.00,  0.60,  0.28]), float('nan')),  # position-only
-
-    (np.array([ 0.00, -1.20,  0.30]), float('nan')),  # orient D — phase 1: position
-    (np.array([ 0.00, -1.20,  0.30]), -0.5),           # orient D — phase 2: q4 yaw = -0.5 rad
-    'Q4_RESET',                                         # orient D — phase 3: q4 → 0
-
-    (np.array([ 0.80,  0.80,  0.36]), float('nan')),  # orient E — phase 1: position
-    (np.array([ 0.80,  0.80,  0.36]),  0.0),           # orient E — phase 2: q4 yaw =  0.0 rad
-    'Q4_RESET',                                         # orient E — phase 3: q4 → 0
-
-    (np.array([ 1.10, -0.40,  0.28]), float('nan')),  # orient F — phase 1: position
-    (np.array([ 1.10, -0.40,  0.28]),  0.8),           # orient F — phase 2: q4 yaw = +0.8 rad
-    # (np.array([ 1.10, -0.40,  0.28]),  0.1),           # same position, reachable yaw (psi~-1.6 → q1+q4 need ~1.7)
-    'Q4_RESET',                                         # orient F — phase 3: q4 → 0
+    (np.array([ 0.00, -1.20,  0.30]), -0.5),           # orient: q4 yaw = -0.5 rad
+    (np.array([ 0.80,  0.80,  0.36]),  0.0),           # orient: q4 yaw =  0.0 rad
+    (np.array([ 1.10, -0.40,  0.28]),  0.8),           # orient: q4 yaw = +0.8 rad
 ]
 
 # How long (seconds) the arm tries to reach each goal before cycling to the next
-DEFAULT_GOAL_CYCLE_PERIOD = 30.0
+DEFAULT_GOAL_CYCLE_PERIOD = 60.0
 
 # Safety margin applied inside the URDF hard limits when clamping velocities.
 # Stops the joint slightly before the hard limit to give the controller time
@@ -174,7 +165,7 @@ class Lab2RRCMethodsVMSNode(Node):
         self.declare_parameter('yaw_gain_k', 0.3)  # separate gain for yaw component (lower = less aggressive)
         self.declare_parameter('max_vel',   0.3)   # maximum joint speed after scaling (rad/s)
         self.declare_parameter('damping',   0.05)  # DLS lambda: higher = smoother near singularities
-        self.declare_parameter('method',    2)     # active RRC method: 0=transpose, 1=pinv, 2=DLS
+        self.declare_parameter('method',    1)     # active RRC method: 0=transpose, 1=pinv, 2=DLS
         self.declare_parameter('enabled',   True)  # False -> send zeros, arm holds still
 
         # Goal cycling: whether to auto-advance goals and at what rate
@@ -183,8 +174,8 @@ class Lab2RRCMethodsVMSNode(Node):
 
         # Mobile base velocity control parameters
         self.declare_parameter('base_vel_enabled', True)  # enable/disable base movement
-        self.declare_parameter('base_linear_max',  0.4)   # max linear velocity (m/s)
-        self.declare_parameter('base_angular_max', 0.4)   # max angular velocity (rad/s)
+        self.declare_parameter('base_linear_max',  0.1)   # max linear velocity (m/s)
+        self.declare_parameter('base_angular_max', 0.1)   # max angular velocity (rad/s)
         self.declare_parameter('error_threshold',  0.15)  # distance (m): base moves if error > this
         self.declare_parameter('error_stop',       0.03)  # distance (m): all motion stops when pos error < this
         self.declare_parameter('yaw_stop',         0.08)  # (rad, ~4.6°): all motion stops when yaw error < this
@@ -247,6 +238,14 @@ class Lab2RRCMethodsVMSNode(Node):
         # even if the control loop occasionally misses a tick.
         self._goal_cycle_timer = self.create_timer(
             DEFAULT_GOAL_CYCLE_PERIOD, self._advance_goal)
+
+        # Sub-task index within the current goal (time-based, timer-driven).
+        # Position-only goals have 1 sub-task (index 0 only).
+        # Orient goals have 3 sub-tasks: 0=position, 1=yaw(q4), 2=q4_reset.
+        self._sub_phase_idx = 0
+
+        # Accumulated log entries — written to file on Ctrl+C.
+        self._log_entries = []
 
         # Buffer stores a sliding window of recent transforms from /tf and /tf_static
         self._tf_buffer = Buffer()
@@ -353,21 +352,26 @@ class Lab2RRCMethodsVMSNode(Node):
             self._goal_cycle_timer.destroy()
             self._goal_cycle_timer = self.create_timer(period, self._advance_goal)
 
-        # Advance goal index, wrapping back to 0 after the last goal
-        self._goal_idx = (self._goal_idx + 1) % len(GOAL_SEQUENCE)
+        # Current goal determines how many sub-tasks exist.
+        goal_pos, goal_yaw = GOAL_SEQUENCE[self._goal_idx]
+        num_phases = 3 if math.isfinite(goal_yaw) else 1
 
-        entry = GOAL_SEQUENCE[self._goal_idx]
-
-        # 'Q4_RESET' entries and None entries need no ROS parameter update.
-        if entry is None or isinstance(entry, str):
-            label = entry if isinstance(entry, str) else 'RESET'
+        # Advance sub-task first; only move to the next goal when all sub-tasks done.
+        self._sub_phase_idx += 1
+        if self._sub_phase_idx < num_phases:
+            sub_names = ['position', 'yaw/q4', 'q4_reset']
             self.get_logger().info(
-                f'[GOAL CYCLE] -> goal {self._goal_idx}/{len(GOAL_SEQUENCE)-1}: {label}')
+                f'[GOAL CYCLE] -> goal {self._goal_idx}/{len(GOAL_SEQUENCE)-1} '
+                f'sub-task {self._sub_phase_idx}: {sub_names[self._sub_phase_idx]}')
             return
 
-        goal_pos, goal_yaw = entry
+        # All sub-tasks done — advance to next goal and reset sub-task index.
+        self._sub_phase_idx = 0
+        self._goal_idx = (self._goal_idx + 1) % len(GOAL_SEQUENCE)
 
-        # Write the new target back into the ROS parameter server
+        goal_pos, goal_yaw = GOAL_SEQUENCE[self._goal_idx]
+
+        # Write the new target back into the ROS parameter server.
         self.set_parameters([
             Parameter('target_x',   Parameter.Type.DOUBLE, float(goal_pos[0])),
             Parameter('target_y',   Parameter.Type.DOUBLE, float(goal_pos[1])),
@@ -473,7 +477,7 @@ class Lab2RRCMethodsVMSNode(Node):
             self.get_logger().warn('TF unavailable — using 5-DOF FK for error',
                                    throttle_duration_sec=1.0)
 
-        # ── Task-Priority Control ─────────────────────────────────────────────
+        # Task-Priority Control 
         # Update the shared robot state container used by all task objects.
         self._vms_state.update(
             ee_for_jac,
@@ -482,23 +486,23 @@ class Lab2RRCMethodsVMSNode(Node):
             q_arm,
             self._tf_buffer)
 
-        # Determine current entry type from GOAL_SEQUENCE directly.
+        # Select sub-task based on time-based index (timer-driven, no thresholds).
+        # Sub-task 0: position task (all goals).
+        # Sub-task 1: q4 yaw task  (orient goals only, timer fires after period).
+        # Sub-task 2: q4 reset     (orient goals only, timer fires after period).
         yaw_k = float(self.get_parameter('yaw_gain_k').value)
-        current_entry = GOAL_SEQUENCE[self._goal_idx]
-        q4_reset_mode = isinstance(current_entry, str)          # 'Q4_RESET'
-        yaw_phase     = (not q4_reset_mode) and orient_mode     # finite yaw entry
+        sub  = self._sub_phase_idx
 
-        # Build task list based on entry type — no state machine, no thresholds.
-        if q4_reset_mode:
-            # Drive q4 directly to 0; base and q1-q3 untouched.
+        if sub == 2:
+            # Q4 reset: drive q4 to 0, base and q1-q3 untouched.
             tasks = self._joint_limit_tasks + [self._q4_zero_task]
-        elif yaw_phase:
-            # q4-only yaw alignment; L_EE_TOOL=0 so zero position coupling.
+        elif sub == 1 and orient_mode:
+            # Q4 yaw alignment: only q4 moves, zero position coupling.
             self._yaw_task.setDesired(np.array([[t_yaw]]))
             self._yaw_task.setGain(np.array([[yaw_k]]))
             tasks = self._joint_limit_tasks + [self._yaw_task]
         else:
-            # Position task (position-only goal or position phase of orient goal).
+            # Position task (sub-task 0, or position-only goals).
             self._pos_task.setDesired(target_world_enu.reshape(3, 1))
             self._pos_task.setGain(np.diag([K_gain] * 3))
             tasks = self._joint_limit_tasks + [self._pos_task]
@@ -511,12 +515,12 @@ class Lab2RRCMethodsVMSNode(Node):
             dzeta = np.zeros(6)
 
         # Extract logged quantities.
-        if q4_reset_mode:
+        if sub == 2:
             self._q4_zero_task.update(self._vms_state)
             yaw_err  = float('nan')
             pos_err  = np.zeros((3, 1))
             J_cond   = float(np.linalg.cond(self._q4_zero_task.getJacobian()))
-        elif yaw_phase:
+        elif sub == 1 and orient_mode:
             self._yaw_task.update(self._vms_state)
             yaw_err = float(self._yaw_task.getError()[0, 0])
             pos_err = (target_world_enu - (ee_world_enu if ee_world_enu is not None
@@ -542,12 +546,30 @@ class Lab2RRCMethodsVMSNode(Node):
         v_base_linear  = float(scale_velocities(np.array([v_base_linear]),  base_lin_max)[0])
         v_base_angular = float(scale_velocities(np.array([v_base_angular]), base_ang_max)[0])
 
-        # Low-pass filter on omega: when q1/q4 hit limits simultaneously the DLS
-        # flips omega sign every tick to compensate yaw. α=0.35 keeps ~65% of the
-        # previous value, killing high-frequency alternation without lagging too much.
-        # OMEGA_LPF_ALPHA = 0.35
-        # v_base_angular = OMEGA_LPF_ALPHA * v_base_angular + (1.0 - OMEGA_LPF_ALPHA) * self._omega_lpf
-        # self._omega_lpf = v_base_angular
+        # J_cond-based base velocity scaling — primary orbit fix.
+        #
+        # Root cause of orbit: J_cond spikes to 20-26 when q3 hits its limit in
+        # goal 2's workspace. The DLS amplifies velocities unreliably near
+        # singularities, saturating both vx and omega simultaneously → circular
+        # motion. The error-proportional cap alone doesn't trigger because omega
+        # is already below the cap at that range.
+        #
+        # Fix: scale base velocities DOWN proportional to J_cond when ill-conditioned.
+        # Arm joints (dq1-dq4) are NOT scaled so they keep reconfiguring the arm,
+        # naturally reducing J_cond and exiting the singular region.
+        #   J_cond=10 → scale=1.0 (no change)
+        #   J_cond=20 → scale=0.5 (half speed base)
+        #   J_cond=25 → scale=0.4 (orbit region: forces slow creep vs spinning)
+        # JCOND_THRESHOLD = 10.0
+        # if J_cond > JCOND_THRESHOLD:
+        #     jcond_scale = JCOND_THRESHOLD / J_cond
+        #     v_base_linear  *= jcond_scale
+        #     v_base_angular *= jcond_scale
+
+        # Error-proportional omega cap — secondary guard for close-range spinning.
+        # orbit_dist = 0.8   # metres
+        # omega_cap = base_ang_max * min(1.0, err_norm / orbit_dist)
+        # v_base_angular = float(np.clip(v_base_angular, -omega_cap, omega_cap))
 
         # Scale arm joints uniformly so direction is preserved.
         all_dq = scale_velocities(np.array([dq_arm[0], dq_arm[1], dq_arm[2], dq4]), mv)
@@ -588,10 +610,12 @@ class Lab2RRCMethodsVMSNode(Node):
         # Verbose debug log (every 30 loops ≈ 0.5 s)
         if self._loop_count % 30 == 0:
             q      = self.arm.q
-            if q4_reset_mode:
-                mode_str = f'Q4_RESET  (q4={self.arm.q[3]:.3f} → 0)'
-            elif yaw_phase:
-                mode_str = f'yaw/q4-only(target={t_yaw:.2f} rad)'
+            if sub == 2:
+                mode_str = f'q4_reset  (q4={self.arm.q[3]:.3f} → 0)'
+            elif sub == 1 and orient_mode:
+                mode_str = f'yaw/q4-only  (target={t_yaw:.2f} rad, q4={self.arm.q[3]:.3f})'
+            elif orient_mode:
+                mode_str = f'orient/position  (target_yaw={t_yaw:.2f} rad)'
             else:
                 mode_str = 'position-only'
 
@@ -617,7 +641,7 @@ class Lab2RRCMethodsVMSNode(Node):
             else:
                 orient_lines = ''
 
-            self.get_logger().info(
+            log_str = (
                 f'\n{"─"*70}\n'
                 f'  solver      : task-priority | method: {method_name}  |  enabled: {ena}  |  mode: {mode_str}\n'
                 f'  goal_idx    : {self._goal_idx}/{len(GOAL_SEQUENCE)-1}\n'
@@ -636,9 +660,12 @@ class Lab2RRCMethodsVMSNode(Node):
                 f'  dq[1-4]     : {np.round(dq_arr,4)}\n'
                 f'  J_cond(pos) : {J_cond:.1f}\n'
                 f'  active_lims : {active_limits if active_limits else "none"}\n'
-                f'  params      : K={K_gain}  yaw_k={yaw_k:.2f}  mv={mv}  dam={dam}\n'
+                f'  params      : K={K_gain}  yaw_k={yaw_k:.2f}  mv={mv}  dam={dam}  '
+                # f'jcond_thr={JCOND_THRESHOLD:.0f}  orbit_dist={orbit_dist:.1f}m\n'
                 f'{"─"*70}'
             )
+            self.get_logger().info(log_str)
+            self._log_entries.append(log_str)
 
         # Markers
         self._publish_markers(
@@ -751,13 +778,29 @@ class Lab2RRCMethodsVMSNode(Node):
         self.pub_markers.publish(ma)
 
 
+    def save_log(self):
+        """Write all accumulated log entries to a timestamped text file."""
+        if not self._log_entries:
+            self.get_logger().info('No log entries to save.')
+            return
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_dir = os.path.expanduser('~/ROS2_Crash_Course/ros2_ws/src/hoi_control/logs')
+        os.makedirs(log_dir, exist_ok=True)
+        filepath = os.path.join(log_dir, f'vms_log_{timestamp}.txt')
+        with open(filepath, 'w') as f:
+            f.write(f'VMS node log — saved {datetime.datetime.now()}\n')
+            f.write(f'Total entries: {len(self._log_entries)}\n')
+            f.write('\n'.join(self._log_entries))
+        self.get_logger().info(f'Log saved → {filepath}  ({len(self._log_entries)} entries)')
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = Lab2RRCMethodsVMSNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.save_log()
     node.destroy_node()
     rclpy.shutdown()
 
