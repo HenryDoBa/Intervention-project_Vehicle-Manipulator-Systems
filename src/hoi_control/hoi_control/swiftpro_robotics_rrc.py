@@ -8,9 +8,7 @@ from geometry_msgs.msg import Point, Vector3Stamped, TransformStamped
 import rclpy
 TF_AVAILABLE = True
 from tf_transformations import quaternion_matrix
-# ---------------------------------------------------------------------------
 # uArm Swift Pro – geometric link parameters (metres)
-# ---------------------------------------------------------------------------
 # These constants were derived by tracing the URDF joint chain geometrically
 # (no DH convention — invalid for closed-chain parallelogram linkages).
 #
@@ -258,161 +256,6 @@ def swiftpro_jacobian_with_tf_transform(q, tf_buffer=None, source_frame='world_n
     return J_target
 
 
-def swiftpro_fk(q):
-    """
-    Arguments
-    ---------
-    q : array-like, shape (3,) or (4,)
-        [q1, q2, q3] or [q1, q2, q3, q4].
-        Only q1, q2, q3 affect EE position; q4 adds EE yaw (orientation only,
-        assuming L_EE_TOOL = 0).
-
-    Returns
-    -------
-    p : np.ndarray, shape (3,)
-        [x, y, z] displacement from J1 in world_enu-aligned axes (metres).
-        Add J1's world_enu position from TF to get absolute world coordinates.
-    """
-    q1, q2, q3 = float(q[0]), float(q[1]), float(q[2])
-
-    # q1 phase correction 
-    # The formula x=-r·cos(q1), y=r·sin(q1) assumes q1=0 means arm points West
-    #(-x in world_enu).  In this simulator, q1=0 means arm points South (-y).
-    # Subtracting π/2 bridges that 90° gap. 
-    q1_eff = q1 - np.pi / 2
-
-    # Horizontal reach from J1 yaw axis to link8A 
-    # r = base_offset - L2·sin(q2) + L3·cos(q3)
-    r    = 0.0127 - L2 * np.sin(q2) + L3 * np.cos(q3)
-
-    # Height above J1 in ENU
-    # z_enu = base_height + L2·cos(q2) + L3·sin(q3)
-    z_enu = -0.0382 + L2 * np.cos(q2) + L3 * np.sin(q3)
-
-    # Extend to end_effector 
-    # L_J4 = 0.0565 m: horizontal distance from link8A to link8B (joint4 pivot).
-    # This offset is always along the arm's reach direction because the
-    # parallelogram keeps link8A horizontal regardless of q2, q3.
-    r_ee = r + L_J4
-
-    # 0.0722 m: vertical offset from link8B to end_effector, defined by the
-    # static_transform_publisher in the launch file (xyz="0 0 0.0722").
-    # This is always vertical (world_enu z) because the parallelogram keeps
-    # link8B level at all configurations.
-    z_ee = z_enu + 0.0722
-
-    # Apply q1 rotation to get world_enu x and y 
-    # The arm sweeps a horizontal circle of radius r_ee as q1 changes.
-    # The negative sign on x comes from the original NED derivation, confirmed
-    # empirically against TF data.
-    x_enu = -r_ee * np.cos(q1_eff)
-    y_enu =  r_ee * np.sin(q1_eff)
-
-    return np.array([x_enu, y_enu, z_ee])
-
-
-
-# 3-DOF Geometric Jacobian (position only, 3×3)
-def swiftpro_jacobian(q):
-    """
-    Arguments
-    ---------
-    q : array-like, shape (3,) or (4,) - only first 3 elements used.
-
-    Returns
-    -------
-    J : np.ndarray, shape (3, 3)
-        Rows → [dx, dy, dz] in world_enu-aligned axes.
-        Columns → [dq1, dq2, dq3].
-    """
-    q1, q2, q3 = float(q[0]), float(q[1]), float(q[2])
-
-    # Same π/2 shift as FK — Jacobian must be consistent with FK
-    q1_eff = q1 - np.pi / 2
-    s1, c1 = np.sin(q1_eff), np.cos(q1_eff)
-
-    s2, c2 = np.sin(q2), np.cos(q2)
-    s3, c3 = np.sin(q3), np.cos(q3)
-
-    r      = 0.0127 - L2 * s2 + L3 * c3   # reach to link8A (note: uses original r constant)
-    r_ee   = r + L_J4                       # total reach including joint4 offset
-
-    dr_dq2 = -L2 * c2   # ∂r/∂q2
-    dr_dq3 = -L3 * s3   # ∂r/∂q3
-    dz_dq2 = -L2 * s2   # ∂z/∂q2
-    dz_dq3 =  L3 * c3   # ∂z/∂q3
-
-    J = np.array([
-        # ── q1 column ──────    ── q2 column ─────────    ── q3 column ──────
-        [  r_ee * s1,            -dr_dq2 * c1,             -dr_dq3 * c1  ],  # ∂x/∂qi
-        [  r_ee * c1,             dr_dq2 * s1,              dr_dq3 * s1  ],  # ∂y/∂qi
-        [  0.0,                   dz_dq2,                    dz_dq3      ],  # ∂z/∂qi
-    ])
-    return J
-
-
-
-# 4-DOF Jacobians  (include joint4 EE yaw)
-def swiftpro_jacobian_pos4(q, tf_buffer=None):
-    """
-    Arguments
-    ---------
-    q : array-like, shape (4,) – [q1, q2, q3, q4]
-
-    Returns
-    -------
-    J : np.ndarray, shape (3, 4)
-    """
-    q1, q4 = float(q[0]), float(q[3])
-    # J3 = swiftpro_jacobian(q)   # (3, 3) — first three columns
-    # J3 = swiftpro_jacobian_with_tf_transform(q, tf_buffer=tf_buffer)   # (3, 3) — first three columns
-    J3 = swiftpro_jacobian(q)   # (3, 3) — correct Jacobian with pi/2 shift
-
-    # 4th column: EE position sensitivity to q4
-    # With L_EE_TOOL=0 this is [0,0,0]; non-zero only if a tool is mounted.
-    angle_j4 = q1 + q4   # direction of link8B in the horizontal plane
-    col4 = np.array([
-        L_EE_TOOL * np.sin(angle_j4),
-        L_EE_TOOL * np.cos(angle_j4),
-        0.0
-    ])
-
-    return np.hstack([J3, col4.reshape(3, 1)])   # (3, 4)
-
-
-def swiftpro_jacobian_full4(q):
-    """
-    4-DOF full Jacobian mapping [dq1, dq2, dq3, dq4] → [dx, dy, dz, d(yaw)].
-    Shape: (4, 4).  Use this for combined position + EE yaw control.
-
-    The top 3 rows are swiftpro_jacobian_pos4 (position).
-    The bottom row maps joint velocities to EE yaw rate.
-
-    Yaw row derivation:
-    ───────────────────
-    EE yaw in world_enu = q1 + q4.
-    Both q1 (base yaw) and q4 (EE yaw joint) rotate the EE about the same
-    vertical axis.  The parallelogram constraint keeps pitch and roll fixed.
-
-        dyaw/dq1 = 1,  dyaw/dq2 = 0,  dyaw/dq3 = 0,  dyaw/dq4 = 1
-
-    When using this Jacobian, the error vector must be 4X1: [ex, ey, ez, e_yaw].
-    Always wrap e_yaw to [−π, π] before use to avoid the controller spinning
-    the long way around.
-
-    Arguments
-    ---------
-    q : array-like, shape (4,)
-
-    Returns
-    -------
-    J : np.ndarray, shape (4, 4)
-    """
-    J_pos4  = swiftpro_jacobian_pos4(q)              # (3, 4)
-    yaw_row = np.array([[1.0, 0.0, 0.0, 1.0]])       # dyaw/d[q1,q2,q3,q4]
-    return np.vstack([J_pos4, yaw_row])               # (4, 4)
-
-
 def swiftpro_jacobian_pos4_with_tf_transform(q, tf_buffer=None, source_frame='world_ned', target_frame='world_enu'):
     """
     3×4 position Jacobian with TF frame transform, including q4 EE yaw column.
@@ -488,23 +331,25 @@ def swiftpro_fk_vms_5dof(j1_world, arm_q, base_yaw, tf_buffer):
     """
     EE position in world_enu for the VMS (Turtlebot + uArm Swift Pro).
 
-    swiftpro_fk() bakes in the calibration q1_eff = q1 − π/2, which makes it
-    correct only when the base is at the scenario initial yaw ψ_scenario = π/2.
-    For any base yaw ψ the correct EE-from-J1 vector in world_enu is:
+    swiftpro_fk_with_tf_transform uses q1_eff = q1 − π internally, which
+    is calibrated for q1 measured in world frame (from NED North axis).
+    The robot's q1, however, is measured relative to the base heading ψ.
+    To reconcile: subtract base_yaw from q1 before calling FK so that the
+    modified q1 is world-frame-relative:
 
-        x = −r_ee · cos(q1 − ψ)
-        y =  r_ee · sin(q1 − ψ)
+        q_mod[0] = q1 − ψ
+        q1_eff   = q_mod[0] − π  =  q1 − ψ − π  (inside FK)
 
-    Substituting q1_mod = q1 − (ψ − π/2) into swiftpro_fk gives:
-        q1_eff_mod = q1_mod − π/2 = q1 − ψ  ✓
-
-    No rotation matrix needed — the q1 substitution handles any base yaw.
+    The FK then computes the EE-from-J1 vector in NED and the TF buffer
+    (or manual fallback rotation) converts it to world_enu.
+    Adding j1_world gives the absolute EE position.
 
     Parameters
     ----------
     j1_world : (3,) J1 (link1) position in world_enu — from TF.
     arm_q    : (3,) or (4,) arm joint angles [q1, q2, q3, ...].
-    base_yaw : current base yaw in world_enu (rad).
+    base_yaw : current base yaw ψ in world_enu (rad).
+    tf_buffer: tf2_ros.Buffer for NED→ENU frame transform; None uses fallback.
 
     Returns
     -------
@@ -518,28 +363,33 @@ def swiftpro_jacobian_vms_5dof(ee_world, base_world, base_yaw, arm_q, tf_buffer)
     """
     3×5 VMS position Jacobian in world_enu.
 
-    Maps quasi-velocities ζ = [vx, ω, dq1, dq2, dq3] → EE linear velocity.
+    Maps quasi-velocities ζ = [vx, ω, dq1, dq2, dq3] -> EE linear velocity.
 
-    Geometric column derivation (cf. jacobianLink in lab6_robotics.py):
+    Geometric column derivation:
 
       col_vx  : body x-axis in world = [cos ψ, sin ψ, 0]ᵀ
-                Prismatic DOF: translating the base moves EE along heading.
+                Prismatic DOF: translating the base moves the EE along the
+                current heading direction.
 
       col_ω   : z_B × (p_EE − p_BASE) = [−Δy, Δx, 0]ᵀ
-                Revolute DOF around body z.  Rotation centre = BASE centre
-                (base_footprint), NOT J1/link1.
+                Revolute DOF around the vertical axis at the BASE centre
+                (base_footprint), NOT at J1/link1.
 
-      col_dqi : swiftpro_jacobian evaluated at q1_mod = q1 − (ψ − π/2).
-                Same q1 substitution as swiftpro_fk_vms_5dof — gives the
-                correct partial derivatives in world_enu at current base yaw.
-                No Rz matrix needed.
+      col_dqi : arm position Jacobian (3×3) from swiftpro_jacobian_with_tf_transform,
+                evaluated at q_mod[0] = q1 − ψ.
+                Subtracting base_yaw from q1 converts the arm's base-relative
+                joint angle into a world-frame-relative angle, which is what
+                swiftpro_jacobian_with_tf_transform expects.  The TF buffer (or
+                manual fallback rotation) then converts the NED Jacobian columns
+                to world_enu, giving correct ∂p/∂qi at the current base yaw ψ.
 
     Parameters
     ----------
     ee_world  : (3,) current EE position in world_enu (TF or FK).
     base_world: (3,) or (2,) base centre (base_footprint) in world_enu.
-    base_yaw  : current base yaw in world_enu (rad).
+    base_yaw  : current base yaw ψ in world_enu (rad).
     arm_q     : (3,) or (4,) arm joint angles [q1, q2, q3, ...].
+    tf_buffer : tf2_ros.Buffer for NED→ENU frame transform; None uses fallback.
 
     Returns
     -------
@@ -548,16 +398,16 @@ def swiftpro_jacobian_vms_5dof(ee_world, base_world, base_yaw, arm_q, tf_buffer)
     bx, by = float(base_world[0]), float(base_world[1])
     ex, ey = float(ee_world[0]),   float(ee_world[1])
 
-    # ── Column 0: vx (prismatic along body x-axis in world) ──────────────
+    # Column 0: vx (prismatic along body x-axis in world) 
     col_vx = np.array([math.cos(base_yaw), math.sin(base_yaw), 0.0])
 
-    # ── Column 1: ω (revolute around body z at BASE centre) ──────────────
+    # Column 1: ω (revolute around body z at BASE centre) 
     # jacobianLink pattern: col = z_B × (p_EE − p_B), z_B=[0,0,1]
     col_omega = np.array([-(ey - by), (ex - bx), 0.0])
 
-    # ── Columns 2–4: arm joints ───────────────────────────────────────────
-    # Substitute q1_mod = q1 − (ψ − π/2) — same correction as FK.
-    # swiftpro_jacobian with q1_mod gives ∂p/∂qi in world_enu at current ψ.
+    # Columns 2–4: arm joints
+    # Substitute q_mod[0] = q1 − ψ — same world-frame correction as FK.
+    # swiftpro_jacobian_with_tf_transform then gives ∂p/∂qi in world_enu at current ψ.
     q_mod    = np.array(arm_q, dtype=float)
     q_mod[0] -= (base_yaw)
     J_arm_world = swiftpro_jacobian_with_tf_transform(q_mod, tf_buffer=tf_buffer)  # (3, 3) correct at current ψ
@@ -668,12 +518,14 @@ class SwiftProManipulator4DOF:
 
     DOF = 4   # q1, q2, q3, q4 (all active)
 
-    def __init__(self, q0=None):
+    def __init__(self, q0=None, tf_buffer=None):
         """
-        q0 : initial joint angles [q1, q2, q3, q4] (rad).
-             Defaults to all zeros.
+        q0        : initial joint angles [q1, q2, q3, q4] (rad). Defaults to zeros.
+        tf_buffer : tf2_ros.Buffer for frame transforms. If None, falls back to
+                    manual NED→ENU rotation inside the TF-variant kinematics calls.
         """
-        self.q = np.zeros(4) if q0 is None else np.array(q0, dtype=float)
+        self.q         = np.zeros(4) if q0 is None else np.array(q0, dtype=float)
+        self.tf_buffer = tf_buffer
 
     #  State update                                                        
     def update_from_joint_states(self, names, positions):
@@ -725,7 +577,7 @@ class SwiftProManipulator4DOF:
         Only q1, q2, q3 affect position; q4 is pure orientation (yaw only).
         Add J1's world_enu position from TF to get absolute world coordinates.
         """
-        return swiftpro_fk(self.q)
+        return swiftpro_fk_with_tf_transform(self.q, tf_buffer=self.tf_buffer)
 
     def getEEYaw(self):
         """
@@ -741,17 +593,17 @@ class SwiftProManipulator4DOF:
         world_enu-aligned axes.  4th column = [0,0,0] when L_EE_TOOL=0
         (q4 is a pure orientation DOF with no positional effect).
         """
-        return swiftpro_jacobian_pos4(self.q)
+        return swiftpro_jacobian_pos4_with_tf_transform(self.q, tf_buffer=self.tf_buffer)
 
     def getEEJacobianFull(self):
         """
         4X4 Jacobian mapping dq -> [dx, dy, dz, d(yaw)] in world_enu-aligned
         axes.  Use for combined position + EE yaw control tasks.
         """
-        return swiftpro_jacobian_full4(self.q)
+        return swiftpro_jacobian_full4_with_tf_transform(self.q, tf_buffer=self.tf_buffer)
 
 
-# ===========================================================================
+
 #  Task-Priority Control for VMS (Turtlebot + SwiftPro)
 #
 #  Quasi-velocity space: ζ = [vx, ω, dq1, dq2, dq3, dq4]  (6 DOF)
@@ -763,7 +615,6 @@ class SwiftProManipulator4DOF:
 #    3 = q2   (arm shoulder)
 #    4 = q3   (arm elbow)
 #    5 = q4   (EE yaw)
-# ===========================================================================
 
 class VMSRobotState:
     """
@@ -787,6 +638,14 @@ class VMSRobotState:
         self.base_psi  = float(base_psi)
         self.arm_q     = np.asarray(arm_q,    dtype=float)
         self.tf_buffer = tf_buffer
+
+    def update_from_joint_states(self, names, positions):
+        """Parse a JointState message and update arm_q [q1,q2,q3,q4] in place.
+        Joints are matched by name so message ordering doesn't matter."""
+        pos_map = dict(zip(names, positions))
+        for i, jn in enumerate(JOINT_NAMES_4DOF):
+            if jn in pos_map:
+                self.arm_q[i] = pos_map[jn]
 
     def getDOF(self):
         return self.DOF
@@ -851,7 +710,6 @@ class Task:
 
 # ---------------------------------------------------------------------------
 #  Task subclasses for VMS
-# ---------------------------------------------------------------------------
 
 class VMSPositionTask(Task):
     """
@@ -1046,9 +904,8 @@ class VMSYawQ4Task(Task):
 
 # ---------------------------------------------------------------------------
 #  Recursive Task-Priority solver for VMS
-# ---------------------------------------------------------------------------
 
-def vms_task_priority_step(tasks, state, damping=0.1):
+def vms_task_priority_step(tasks, state, damping=0.1, method=2):
     """
     One step of the recursive Task-Priority algorithm for the VMS.
 
@@ -1060,7 +917,11 @@ def vms_task_priority_step(tasks, state, damping=0.1):
     ---------
     tasks   : list[Task]       — ordered highest → lowest priority
     state   : VMSRobotState    — current robot state (call update() first)
-    damping : float            — DLS λ (higher = more stable near singularities)
+    damping : float            — DLS λ (only used when method=2)
+    method  : int              — inverse method for velocity update:
+                                   0 = Jacobian transpose  (J^T, no inversion)
+                                   1 = Moore-Penrose pseudo-inverse  (np.linalg.pinv)
+                                   2 = Damped Least-Squares (default, stable near singularities)
 
     Returns
     -------
@@ -1083,11 +944,19 @@ def vms_task_priority_step(tasks, state, damping=0.1):
         ff_i   = task.getFF()
         xi_dot = Ki @ err_i + ff_i
 
-        Ji_bar     = Ji @ P
-        Ji_bar_dls = DLS(Ji_bar, damping)
+        Ji_bar = Ji @ P
 
-        zeta = zeta + Ji_bar_dls @ (xi_dot - Ji @ zeta)
+        # Compute the velocity-update inverse according to the chosen method.
+        if method == 0:
+            Ji_bar_inv = Ji_bar.T                    # Jacobian transpose
+        elif method == 1:
+            Ji_bar_inv = np.linalg.pinv(Ji_bar)      # Moore-Penrose pseudo-inverse
+        else:
+            Ji_bar_inv = DLS(Ji_bar, damping)        # Damped Least-Squares (default)
 
+        zeta = zeta + Ji_bar_inv @ (xi_dot - Ji @ zeta)
+
+        # Null-space projector always uses Moore-Penrose pinv for geometric correctness.
         Ji_bar_pinv = np.linalg.pinv(Ji_bar)
         P = P - Ji_bar_pinv @ Ji_bar
 
@@ -1106,11 +975,11 @@ class VMSObstacleTask(Task):
     Hysteresis (r_d > r_a) prevents rapid on/off chattering at the boundary.
 
     Activation function (same pattern as JointLimits):
-      - Activates when   distance(EE, obs) ≤ r_a
-      - Deactivates when distance(EE, obs) ≥ r_d   (r_d > r_a required)
+      - Activates when   distance(EE, obs) <= r_a
+      - Deactivates when distance(EE, obs) >= r_d   (r_d > r_a required)
 
     Error:    r_a − distance  (positive inside the exclusion sphere)
-    Jacobian: direction.T @ J_pos_3x6   →  1×6 row
+    Jacobian: direction.T @ J_pos_3x6   →  1X6 row
               where direction = unit vector from obstacle centre to EE.
 
     To use cylindrical obstacles (ignore height): pass a 2D obs_pos [x, y]
@@ -1157,15 +1026,15 @@ class VMSObstacleTask(Task):
                 self._active = False
 
         if self._active and self.distance > 1e-6:
-            direction = displacement / self.distance   # unit vector obstacle → EE
+            direction = displacement / self.distance   # unit vector obstacle -> EE
 
-            J_pos = state.getEEJacobian()   # 3×6 VMS position Jacobian
+            J_pos = state.getEEJacobian()   # 3 X 6 VMS position Jacobian
 
             if self.cylindrical:
                 # Map 2D horizontal direction to the x/y rows of J_pos
-                self.J = direction.reshape(1, 2) @ J_pos[:2, :]   # 1×6
+                self.J = direction.reshape(1, 2) @ J_pos[:2, :]   # 1 X 6
             else:
-                self.J = direction.reshape(1, 3) @ J_pos           # 1×6
+                self.J = direction.reshape(1, 3) @ J_pos           # 1 X 6
 
             self.err = np.array([[self.r_a - self.distance]])
         else:

@@ -36,11 +36,7 @@ from tf2_ros import Buffer, TransformListener, LookupException, \
     ConnectivityException, ExtrapolationException
 from hoi_control.swiftpro_robotics_rrc import (
     SwiftProManipulator4DOF,      # 4-DOF arm state + kinematics queries
-    swiftpro_fk,
     swiftpro_fk_with_tf_transform,                  # geometric FK: q -> [x, y, z] in arm-local ENU
-    swiftpro_jacobian,            # 3x3 position Jacobian (3-DOF, used for FK comparison)
-    # swiftpro_jacobian_pos4,     # replaced by TF-transform version below
-    # swiftpro_jacobian_full4,    # replaced by TF-transform version below
     swiftpro_jacobian_pos4_with_tf_transform,   # 3x4 position Jacobian with NED->ENU TF transform
     swiftpro_jacobian_full4_with_tf_transform,  # 4x4 position+yaw Jacobian with NED->ENU TF transform
     DLS,                          # Damped Least-Squares pseudo-inverse
@@ -176,8 +172,10 @@ class Lab2RRCMethodsDebugNode(Node):
 
         # Buffer stores a sliding window of recent transforms from /tf and /tf_static
         self._tf_buffer = Buffer()
-
         self._tf_listener = TransformListener(self._tf_buffer, self)
+
+        # Wire the tf_buffer into the arm so getEEPosition/getEEJacobianPos/Full use TF
+        self.arm.tf_buffer = self._tf_buffer
 
         
         self.sub_js = self.create_subscription(
