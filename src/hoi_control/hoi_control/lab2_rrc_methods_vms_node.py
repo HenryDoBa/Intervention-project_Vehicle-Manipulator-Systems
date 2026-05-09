@@ -1,36 +1,4 @@
 #!/usr/bin/env python3
-"""
-Resolved-Rate Control VMS node — 4-DOF uArm Swift Pro on Turtlebot (joint1-4).
-All control math accounts for mobile base: FK and Jacobian in arm-local, then world_enu.
-
-Vehicle Manipulator System (VMS): The arm is mounted on a mobile Turtlebot.
-Goals are set in world_enu frame (distant from the robot), not relative to the arm.
-
-ARM CONTROL (4-DOF):
-  ros2 param set /lab2_rrc_methods_vms target_x   0.50      # world goal (m)
-  ros2 param set /lab2_rrc_methods_vms target_y   0.00
-  ros2 param set /lab2_rrc_methods_vms target_z   0.40
-  ros2 param set /lab2_rrc_methods_vms target_yaw nan       # position-only
-  ros2 param set /lab2_rrc_methods_vms target_yaw 0.5       # position+yaw
-  ros2 param set /lab2_rrc_methods_vms gain_k     1.0       # arm control gain
-  ros2 param set /lab2_rrc_methods_vms max_vel    0.5       # arm max velocity (rad/s)
-  ros2 param set /lab2_rrc_methods_vms damping    0.05      # DLS damping (lower=accuracy)
-  ros2 param set /lab2_rrc_methods_vms method     2         # 0=transpose, 1=pinv, 2=DLS
-  ros2 param set /lab2_rrc_methods_vms enabled    true/false
-  ros2 param set /lab2_rrc_methods_vms goal_auto_cycle   true/false
-  ros2 param set /lab2_rrc_methods_vms goal_cycle_period 30.0
-
-BASE CONTROL (Mobile base):
-  ros2 param set /lab2_rrc_methods_vms base_vel_enabled   true/false    # move base when error > threshold
-  ros2 param set /lab2_rrc_methods_vms error_threshold    0.15         # (m) when to move base
-  ros2 param set /lab2_rrc_methods_vms base_linear_max    0.5          # (m/s) max base speed
-  ros2 param set /lab2_rrc_methods_vms base_angular_max   1.0          # (rad/s) max turning speed
-
-All targets in world_enu: x=East, y=North, z=Up.
-These are WORLD goals (not relative to arm), accounting for robot pose.
-"""
-
-
 import math
 import datetime
 import os
@@ -65,7 +33,7 @@ from hoi_control.swiftpro_robotics_rrc import (
     VMSRobotState,
     VMSPositionTask,
     VMSYawQ4Task,
-    VMSQ4ZeroTask,
+    VMSJointCenteringTask,
     VMSJointLimitsTask,
     vms_task_priority_step,
 )
@@ -81,10 +49,9 @@ JOINT_CMD_TOPIC   = '/turtlebot/swiftpro/joint_velocity_controller/command'
 JOINT_STATE_TOPIC = '/turtlebot/joint_states'
 
 # Mobile base velocity controller (TurtleBot differential drive)
-# Must publish to the namespaced topic where the simulator's diff_drive_controller is listening
-BASE_CMD_TOPIC    = '/turtlebot/cmd_vel'  # Twist message: linear.x, angular.z (namespaced!)
+BASE_CMD_TOPIC    = '/turtlebot/cmd_vel'  # Twist message: linear.x, angular.z 
 
-# Separate marker topic from lab2_rrc_debug so both nodes can run simultaneously
+# marker topic 
 MARKER_TOPIC      = '/hoi/rrc_methods_vms_markers'
 
 # TF frame in which all world-frame positions are expressed (ENU = East-North-Up)
@@ -100,18 +67,20 @@ J1_FRAME          = 'turtlebot/swiftpro/manipulator_base_link'
 # Control loop period: 60 Hz matches the simulator physics timestep
 DT = 1.0 / 60.0   # seconds per control tick
 
-# ---------------------------------------------------------------------------
+
 # Marker IDs — each ID corresponds to a persistent RViz marker object.
 # Using fixed IDs means successive publishes UPDATE the marker in place
 # rather than creating a new one each tick.
-ID_TARGET   = 0   # RED    sphere  — desired target position
-ID_TF_EE    = 1   # GREEN  sphere  — true EE from TF (colour interpolates to yellow as error grows)
-ID_FK_EE    = 2   # CYAN   sphere  — FK estimate of EE (shows FK accuracy vs TF)
-ID_J1_BASE  = 3   # YELLOW sphere  — J1 arm base (origin of arm-local ENU)
-ID_ERR_LINE = 4   # WHITE  line    — vector from current EE to target (visual error)
-ID_TEXT     = 5   # WHITE  text    — method name, error magnitude, and goal index
+ID_TARGET    = 0   # RED    sphere  — desired target position
+ID_TF_EE     = 1   # GREEN  sphere  — true EE from TF (colour interpolates to yellow as error grows)
+ID_FK_EE     = 2   # CYAN   sphere  — FK estimate of EE (shows FK accuracy vs TF)
+ID_J1_BASE   = 3   # YELLOW sphere  — J1 arm base (origin of arm-local ENU)
+ID_ERR_LINE  = 4   # WHITE  line    — vector from current EE to target (visual error)
+ID_TEXT      = 5   # WHITE  text    — method name, error magnitude, and goal index
+ID_PATH_LINE = 6   # ORANGE line    — straight-line path from start to goal (full intended path)
+ID_PATH_WP   = 7   # ORANGE sphere  — current interpolated waypoint being tracked
 
-# ---------------------------------------------------------------------------
+
 # Automatic goal cycling — DISTANT goals in world_enu (robot-relative, not arm-relative)
 # ---------------------------------------------------------------------------
 # These positions are set DISTANT from the robot base in world_enu frame.
@@ -152,33 +121,63 @@ class Lab2RRCMethodsVMSNode(Node):
         super().__init__('lab2_rrc_methods_vms')
 
         # ── Declare runtime-tunable parameters ────────────────────────────
-        self.declare_parameter('target_x',  0.50)   # East component of target (m, WORLD_enu)
-        self.declare_parameter('target_y',   0.00)  # North component of target (m, WORLD_enu)
-        self.declare_parameter('target_z',   0.30)  # Up component of target (m, WORLD_enu)
 
-        # Optional EE yaw target (radians).
-        # NaN  -> position-only mode: uses 3x4 Jacobian, q4 stays uncontrolled.
-        # finite -> orientation mode: uses 4x4 Jacobian, controls position + yaw.
+        # Goal position in world_enu frame (East-North-Up, metres).
+        # These are absolute world coordinates, not relative to the arm or base.
+        self.declare_parameter('target_x',  0.50)
+        self.declare_parameter('target_y',   0.00)
+        self.declare_parameter('target_z',   0.30)
+
+        # Desired end-effector yaw angle (radians) for the suction cup joint (q4).
+        # NaN   → position-only mode: q4 is not controlled.
+        # float → q4 is driven to this angle after the position sub-task completes.
         self.declare_parameter('target_yaw', float('nan'))
 
-        self.declare_parameter('gain_k',    0.5)   # proportional gain K applied to position error
-        self.declare_parameter('yaw_gain_k', 0.3)  # separate gain for yaw component (lower = less aggressive)
-        self.declare_parameter('max_vel',   0.3)   # maximum joint speed after scaling (rad/s)
-        self.declare_parameter('damping',   0.05)  # DLS lambda: higher = smoother near singularities
-        self.declare_parameter('method',    1)     # active RRC method: 0=transpose, 1=pinv, 2=DLS
-        self.declare_parameter('enabled',   True)  # False -> send zeros, arm holds still
+        # Proportional gain K for the position task: larger = faster convergence,
+        # but too large causes overshoot. Scaled by the identity matrix.
+        self.declare_parameter('gain_k',    0.5)
 
-        # Goal cycling: whether to auto-advance goals and at what rate
-        self.declare_parameter('goal_auto_cycle',   True)                    # enable/disable cycling
-        self.declare_parameter('goal_cycle_period', DEFAULT_GOAL_CYCLE_PERIOD)  # seconds per goal
+        # Proportional gain for the q4 yaw sub-task. Kept lower than gain_k
+        # because yaw correction is a secondary objective.
+        self.declare_parameter('yaw_gain_k', 0.3)
 
-        # Mobile base velocity control parameters
-        self.declare_parameter('base_vel_enabled', True)  # enable/disable base movement
-        self.declare_parameter('base_linear_max',  0.1)   # max linear velocity (m/s)
-        self.declare_parameter('base_angular_max', 0.1)   # max angular velocity (rad/s)
-        self.declare_parameter('error_threshold',  0.15)  # distance (m): base moves if error > this
-        self.declare_parameter('error_stop',       0.03)  # distance (m): all motion stops when pos error < this
-        self.declare_parameter('yaw_stop',         0.08)  # (rad, ~4.6°): all motion stops when yaw error < this
+        # Maximum arm joint speed after uniform scaling (rad/s).
+        # All joint velocities are clipped so the largest does not exceed this.
+        self.declare_parameter('max_vel',   0.3)
+
+        # DLS damping factor λ. Larger → smoother motion near singularities
+        # but larger steady-state position error. Smaller → more accurate but
+        # can produce large velocities at singular configurations.
+        self.declare_parameter('damping',   0.05)
+
+        # Inverse kinematics method selector:
+        #   0 = Jacobian transpose  (fast, no matrix inversion, may not converge)
+        #   1 = Pseudo-inverse      (exact at non-singular configs, unstable near singularities)
+        #   2 = DLS (Damped Least Squares) — recommended, stable near singularities
+        self.declare_parameter('method',    1)
+
+        # Master enable switch. False → publish zero velocities, arm holds still.
+        self.declare_parameter('enabled',   True)
+
+        # Goal cycling: auto-advance through GOAL_SEQUENCE every goal_cycle_period seconds.
+        self.declare_parameter('goal_auto_cycle',   True)
+        # Time (s) each sub-task runs before the timer fires and advances to the next.
+        self.declare_parameter('goal_cycle_period', DEFAULT_GOAL_CYCLE_PERIOD)
+
+        # Maximum base linear speed (m/s). Lower values prevent orbit by reducing
+        # the step size of each DLS update relative to the workspace curvature.
+        self.declare_parameter('base_linear_max',  0.1)
+
+        # Maximum base angular speed (rad/s). Keep proportional to base_linear_max
+        # to avoid generating circular trajectories (orbit) near goals.
+        self.declare_parameter('base_angular_max', 0.2)
+
+        # Position error below which the base stops moving (m).
+        # Prevents micro-oscillations when the EE is very close to the target.
+        self.declare_parameter('error_stop',       0.03)
+
+        # Yaw error below which the yaw sub-task is considered complete (rad).
+        self.declare_parameter('yaw_stop',         0.08)
 
         # SwiftProManipulator4DOF internally holds [q1, q2, q3, q4] and provides
         # FK / Jacobian queries.  Initialised to zeros; updated by _js_cb.
@@ -197,9 +196,9 @@ class Lab2RRCMethodsVMSNode(Node):
         self._pos_task  = VMSPositionTask('ee_position', np.zeros((3, 1)))
         self._yaw_task  = VMSYawQ4Task('ee_yaw_q4', 0.0)   # q4-only, zero position coupling
 
-        # q4 reset task: drives q4 directly to 0 after each yaw phase.
-        self._q4_zero_task = VMSQ4ZeroTask()
-        self._q4_zero_task.setGain(np.array([[0.8]]))
+        # Arm reset task: drives all arm joints [q1,q2,q3,q4] to 0 after each yaw phase.
+        self._q4_zero_task = VMSJointCenteringTask('arm_reset', [0.0, 0.05, 0.05, 0.0])
+        self._q4_zero_task.setGain(np.eye(4) * 0.8)
 
         # Guard flag: skip the control loop until the first /joint_states message
         # arrives so we never compute with stale zero-initialised joint angles
@@ -243,6 +242,15 @@ class Lab2RRCMethodsVMSNode(Node):
         # Position-only goals have 1 sub-task (index 0 only).
         # Orient goals have 3 sub-tasks: 0=position, 1=yaw(q4), 2=q4_reset.
         self._sub_phase_idx = 0
+
+        # Straight-line path tracking for the position sub-task.
+        # _path_start  : EE position (world_enu) when the position sub-task began.
+        # _path_start_t: ROS time when the position sub-task began.
+        # The desired position is interpolated linearly from _path_start to the
+        # goal position over goal_cycle_period seconds, so the EE follows a
+        # straight line in task space rather than curving directly toward the goal.
+        self._path_start   = None   # (3,) ndarray or None
+        self._path_start_t = None   # rclpy.time.Time or None
 
         # Accumulated log entries — written to file on Ctrl+C.
         self._log_entries = []
@@ -354,10 +362,14 @@ class Lab2RRCMethodsVMSNode(Node):
 
         # Current goal determines how many sub-tasks exist.
         goal_pos, goal_yaw = GOAL_SEQUENCE[self._goal_idx]
-        num_phases = 3 if math.isfinite(goal_yaw) else 1
+        # num_phases = 3 if math.isfinite(goal_yaw) else 1   # 3 = position + yaw + arm_reset
+        num_phases = 2 if math.isfinite(goal_yaw) else 1     # 2 = position + yaw (no reset)
 
         # Advance sub-task first; only move to the next goal when all sub-tasks done.
         self._sub_phase_idx += 1
+        # Reset path-tracking state so the new sub-task starts a fresh straight line.
+        self._path_start   = self._last_tf_ee.copy() if self._last_tf_ee is not None else None
+        self._path_start_t = self.get_clock().now()
         if self._sub_phase_idx < num_phases:
             sub_names = ['position', 'yaw/q4', 'q4_reset']
             self.get_logger().info(
@@ -460,6 +472,10 @@ class Lab2RRCMethodsVMSNode(Node):
                                    throttle_duration_sec=1.0)
             return
 
+        # Path-tracking defaults — overwritten inside the position sub-task branch.
+        path_alpha   = float('nan')
+        path_desired = target_world_enu.copy()
+
         # Position error: TF-based if available, otherwise FK-based
         if ee_world_enu is not None:
             pos_err = (target_world_enu - ee_world_enu).reshape(3, 1)
@@ -493,18 +509,44 @@ class Lab2RRCMethodsVMSNode(Node):
         yaw_k = float(self.get_parameter('yaw_gain_k').value)
         sub  = self._sub_phase_idx
 
-        if sub == 2:
-            # Q4 reset: drive q4 to 0, base and q1-q3 untouched.
-            tasks = self._joint_limit_tasks + [self._q4_zero_task]
-        elif sub == 1 and orient_mode:
+        # if sub == 2:
+        #     # Arm reset: drive all joints to 0 (disabled for this test).
+        #     tasks = self._joint_limit_tasks + [self._q4_zero_task]
+        if sub == 1 and orient_mode:
             # Q4 yaw alignment: only q4 moves, zero position coupling.
             self._yaw_task.setDesired(np.array([[t_yaw]]))
             self._yaw_task.setGain(np.array([[yaw_k]]))
+            self._pos_task.setFF(np.zeros((3, 1)))   # clear feedforward from position phase
             tasks = self._joint_limit_tasks + [self._yaw_task]
         else:
-            # Position task (sub-task 0, or position-only goals).
-            self._pos_task.setDesired(target_world_enu.reshape(3, 1))
+            # Position task — straight-line path from start to goal.
+            # Latch the start on the very first tick of this sub-task.
+            if self._path_start is None:
+                self._path_start   = (ee_world_enu.copy() if ee_world_enu is not None
+                                       else fk_world_enu.copy())
+                self._path_start_t = self.get_clock().now()
+
+            elapsed = (self.get_clock().now() - self._path_start_t).nanoseconds / 1e9
+            period  = float(self.get_parameter('goal_cycle_period').value)
+            path_alpha = float(np.clip(elapsed / period, 0.0, 1.0))
+
+            # Interpolated waypoint along the straight line: start → goal.
+            path_desired = self._path_start + path_alpha * (target_world_enu - self._path_start)
+
+            # Feedforward velocity = σ̇_E (velocity of the moving desired point).
+            # From the RRC control law:  ẋ_E = σ̇_E + K·σ̃_E
+            # σ̇_E = (goal - start) / T  — constant along the straight-line path.
+            # Without this term the controller always lags behind the moving waypoint.
+            # Zero the feedforward once the path is complete (alpha=1) so the
+            # feedback term alone handles the final convergence to the fixed goal.
+            if path_alpha < 1.0:
+                ff_vel = (target_world_enu - self._path_start) / period   # (3,) m/s
+            else:
+                ff_vel = np.zeros(3)
+
+            self._pos_task.setDesired(path_desired.reshape(3, 1))
             self._pos_task.setGain(np.diag([K_gain] * 3))
+            self._pos_task.setFF(ff_vel.reshape(3, 1))
             tasks = self._joint_limit_tasks + [self._pos_task]
 
         # Run one step of the recursive Task-Priority algorithm (always DLS).
@@ -515,12 +557,12 @@ class Lab2RRCMethodsVMSNode(Node):
             dzeta = np.zeros(6)
 
         # Extract logged quantities.
-        if sub == 2:
-            self._q4_zero_task.update(self._vms_state)
-            yaw_err  = float('nan')
-            pos_err  = np.zeros((3, 1))
-            J_cond   = float(np.linalg.cond(self._q4_zero_task.getJacobian()))
-        elif sub == 1 and orient_mode:
+        # if sub == 2:   # arm reset logging (disabled)
+        #     self._q4_zero_task.update(self._vms_state)
+        #     yaw_err  = float('nan')
+        #     pos_err  = np.zeros((3, 1))
+        #     J_cond   = float(np.linalg.cond(self._q4_zero_task.getJacobian()))
+        if sub == 1 and orient_mode:
             self._yaw_task.update(self._vms_state)
             yaw_err = float(self._yaw_task.getError()[0, 0])
             pos_err = (target_world_enu - (ee_world_enu if ee_world_enu is not None
@@ -610,9 +652,10 @@ class Lab2RRCMethodsVMSNode(Node):
         # Verbose debug log (every 30 loops ≈ 0.5 s)
         if self._loop_count % 30 == 0:
             q      = self.arm.q
-            if sub == 2:
-                mode_str = f'q4_reset  (q4={self.arm.q[3]:.3f} → 0)'
-            elif sub == 1 and orient_mode:
+            # if sub == 2:   # arm_reset disabled
+            #     q = self.arm.q
+            #     mode_str = f'arm_reset  (q=[{q[0]:.2f},{q[1]:.2f},{q[2]:.2f},{q[3]:.2f}] → [0,0,0,0])'
+            if sub == 1 and orient_mode:
                 mode_str = f'yaw/q4-only  (target={t_yaw:.2f} rad, q4={self.arm.q[3]:.3f})'
             elif orient_mode:
                 mode_str = f'orient/position  (target_yaw={t_yaw:.2f} rad)'
@@ -655,13 +698,14 @@ class Lab2RRCMethodsVMSNode(Node):
                 f'  pos_source  : {position_source}\n'
                 f'  err_norm    : {err_norm:.4f} m\n'
                 f'  err_vec     : {np.round(pos_err.flatten(),4)}\n'
+                f'  path_alpha  : {path_alpha:.3f}  '
+                f'(waypoint {np.round(path_desired,3) if sub == 0 or not orient_mode else np.round(target_world_enu,3)})\n'
                 + orient_lines +
                 f'  [vx, omega] : [{v_base_linear:.4f}, {v_base_angular:.4f}]\n'
                 f'  dq[1-4]     : {np.round(dq_arr,4)}\n'
                 f'  J_cond(pos) : {J_cond:.1f}\n'
                 f'  active_lims : {active_limits if active_limits else "none"}\n'
-                f'  params      : K={K_gain}  yaw_k={yaw_k:.2f}  mv={mv}  dam={dam}  '
-                # f'jcond_thr={JCOND_THRESHOLD:.0f}  orbit_dist={orbit_dist:.1f}m\n'
+                f'  params      : K={K_gain}  yaw_k={yaw_k:.2f}  mv={mv}  dam={dam}\n'
                 f'{"─"*70}'
             )
             self.get_logger().info(log_str)
@@ -670,19 +714,23 @@ class Lab2RRCMethodsVMSNode(Node):
         # Markers
         self._publish_markers(
             target_world_enu, ee_world_enu, fk_world_enu,
-            np.array([self._base_x, self._base_y, 0.0]), err_norm, method_name, yaw_err)
+            np.array([self._base_x, self._base_y, 0.0]), err_norm, method_name, yaw_err,
+            path_start=self._path_start, path_desired=path_desired)
 
     # Marker publisher 
 
-    def _publish_markers(self, target, tf_ee, fk_ee, j1, err_norm, method, yaw_err=float('nan')):
+    def _publish_markers(self, target, tf_ee, fk_ee, j1, err_norm, method,
+                         yaw_err=float('nan'), path_start=None, path_desired=None):
         """
-        Publish 6 RViz markers (same set as lab2_rrc_debug_node.py):
-          RED    sphere  — target position (DISTANT/WORLD goal)
-          GREEN  sphere  — TF EE position (yellow->green as error shrinks)
-          CYAN   sphere  — FK estimate of EE (VMS FK)
+        Publish RViz markers:
+          RED    sphere  — desired target position
+          GREEN  sphere  — TF EE position (yellow→green as error shrinks)
+          CYAN   sphere  — FK estimate of EE
           YELLOW sphere  — J1 base
-          WHITE  line    — error vector from EE to target (visual error)
-          WHITE  text    — method name and error magnitude
+          WHITE  line    — error vector from EE to target
+          WHITE  text    — method name, error, goal index
+          ORANGE line    — straight-line path from start to goal (path_start → target)
+          ORANGE sphere  — current interpolated waypoint being tracked
         """
         # Stamp all markers with the current node time so RViz knows they are fresh
         now = self.get_clock().now().to_msg()
@@ -773,6 +821,24 @@ class Lab2RRCMethodsVMSNode(Node):
         else:
             mt.text = f'[{method}] err={err_norm:.3f}m  goal{self._goal_idx}'
         ma.markers.append(mt)
+
+        # ORANGE line — full intended straight-line path (path_start → target).
+        # Visible as soon as the position sub-task begins; stays fixed until the
+        # goal changes, giving a clear reference for how straight the motion is.
+        if path_start is not None:
+            mp = mk(ID_PATH_LINE, Marker.LINE_STRIP)
+            mp.scale.x = 0.006
+            mp.color.r = 1.0; mp.color.g = 0.5; mp.color.b = 0.0; mp.color.a = 0.8
+            ps = Point(); ps.x = float(path_start[0]); ps.y = float(path_start[1]); ps.z = float(path_start[2])
+            pe = Point(); pe.x = float(target[0]);     pe.y = float(target[1]);     pe.z = float(target[2])
+            mp.points = [ps, pe]
+            ma.markers.append(mp)
+
+        # ORANGE sphere — current interpolated waypoint the controller is tracking.
+        # Slides from path_start to target over the goal_cycle_period, showing
+        # exactly which point the DLS is driving toward at each tick.
+        if path_desired is not None:
+            ma.markers.append(sphere(ID_PATH_WP, path_desired, 1.0, 0.5, 0.0, 0.018))
 
         # Publish all markers in a single message to minimise latency jitter
         self.pub_markers.publish(ma)

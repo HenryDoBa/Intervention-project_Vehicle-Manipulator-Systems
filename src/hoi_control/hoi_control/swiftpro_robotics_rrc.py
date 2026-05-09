@@ -1092,3 +1092,88 @@ def vms_task_priority_step(tasks, state, damping=0.1):
         P = P - Ji_bar_pinv @ Ji_bar
 
     return zeta
+
+
+class VMSObstacleTask(Task):
+    """
+    3D spherical obstacle avoidance task for the VMS (mobile manipulator).
+
+    Mirrors the Obstacle2D inequality task from lab5 but operates in 3D
+    world_enu and uses the full 6-DOF VMS Jacobian, so avoidance is achieved
+    through any combination of base motion (vx, ω) and arm joints (dq1-dq4).
+
+    Obstacle is modelled as a sphere centred at obs_pos_world with radius r_a.
+    Hysteresis (r_d > r_a) prevents rapid on/off chattering at the boundary.
+
+    Activation function (same pattern as JointLimits):
+      - Activates when   distance(EE, obs) ≤ r_a
+      - Deactivates when distance(EE, obs) ≥ r_d   (r_d > r_a required)
+
+    Error:    r_a − distance  (positive inside the exclusion sphere)
+    Jacobian: direction.T @ J_pos_3x6   →  1×6 row
+              where direction = unit vector from obstacle centre to EE.
+
+    To use cylindrical obstacles (ignore height): pass a 2D obs_pos [x, y]
+    and set cylindrical=True — the task then uses only the horizontal distance.
+    """
+
+    def __init__(self, name, obs_pos_world, r_a, r_d, cylindrical=False):
+        """
+        Parameters
+        ----------
+        name          : str   — task name shown in logs
+        obs_pos_world : (2,) or (3,) array — obstacle centre in world_enu
+        r_a           : float — activation radius (exclusion zone boundary)
+        r_d           : float — deactivation radius, must be > r_a
+        cylindrical   : bool  — if True, ignore Z (horizontal distance only)
+        """
+        super().__init__(name, np.zeros((1, 1)))
+        self.obs_pos    = np.array(obs_pos_world, dtype=float)
+        self.r_a        = float(r_a)
+        self.r_d        = float(r_d)
+        self.cylindrical = cylindrical
+        self._active    = False
+        self.distance   = float('inf')
+        self.J          = np.zeros((1, 6))
+        self.err        = np.zeros((1, 1))
+
+    def update(self, state):
+        ee = state.ee_world   # (3,) current EE position in world_enu
+
+        if self.cylindrical:
+            # Horizontal distance only — useful for floor-standing obstacles
+            displacement = ee[:2] - self.obs_pos[:2]
+        else:
+            displacement = ee - self.obs_pos[:3]
+
+        self.distance = float(np.linalg.norm(displacement))
+
+        # Hysteresis activation / deactivation
+        if not self._active:
+            if self.distance <= self.r_a:
+                self._active = True
+        else:
+            if self.distance >= self.r_d:
+                self._active = False
+
+        if self._active and self.distance > 1e-6:
+            direction = displacement / self.distance   # unit vector obstacle → EE
+
+            J_pos = state.getEEJacobian()   # 3×6 VMS position Jacobian
+
+            if self.cylindrical:
+                # Map 2D horizontal direction to the x/y rows of J_pos
+                self.J = direction.reshape(1, 2) @ J_pos[:2, :]   # 1×6
+            else:
+                self.J = direction.reshape(1, 3) @ J_pos           # 1×6
+
+            self.err = np.array([[self.r_a - self.distance]])
+        else:
+            self.J   = np.zeros((1, 6))
+            self.err = np.array([[0.0]])
+
+    def isActive(self):
+        return self._active
+
+    def getDistance(self):
+        return self.distance
