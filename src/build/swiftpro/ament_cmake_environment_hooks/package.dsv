@@ -1,0 +1,4 @@
+source;share/swiftpro/local_setup.bash
+source;share/swiftpro/local_setup.dsv
+source;share/swiftpro/local_setup.sh
+source;share/swiftpro/local_setup.zsh

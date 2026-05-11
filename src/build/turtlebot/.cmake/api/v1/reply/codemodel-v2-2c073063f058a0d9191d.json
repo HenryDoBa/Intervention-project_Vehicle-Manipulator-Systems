@@ -1,0 +1,79 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-af42750820cb3b4f8e37.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.15"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "turtlebot",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "swiftpro_uarm_control::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-swiftpro_uarm_control-c6eb8bd39134c21d819f.json",
+					"name" : "swiftpro_uarm_control",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "turtlebot_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-turtlebot_uninstall-6c2e67301c4e3b18948f.json",
+					"name" : "turtlebot_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-72be77a64017fa330ce7.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot",
+		"source" : "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/turtlebot"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 6
+	}
+}

@@ -1,0 +1,88 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-5c583dd9cda1ee382c14.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.20"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "hoi_control",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ament_cmake_python_build_hoi_control_egg::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ament_cmake_python_build_hoi_control_egg-89793bf89085361b91ae.json",
+					"name" : "ament_cmake_python_build_hoi_control_egg",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ament_cmake_python_copy_hoi_control::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ament_cmake_python_copy_hoi_control-6cd19e9ea76d3136c2b7.json",
+					"name" : "ament_cmake_python_copy_hoi_control",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "hoi_control_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-hoi_control_uninstall-ec0f8107c5c4a32b3044.json",
+					"name" : "hoi_control_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-be7707ee51aaf62494d5.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/hoi_control",
+		"source" : "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/hoi_control"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 6
+	}
+}

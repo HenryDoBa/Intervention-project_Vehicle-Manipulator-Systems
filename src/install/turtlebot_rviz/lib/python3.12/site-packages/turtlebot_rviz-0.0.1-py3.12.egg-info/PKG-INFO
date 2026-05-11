@@ -1,0 +1,8 @@
+Metadata-Version: 2.1
+Name: turtlebot-rviz
+Version: 0.0.1
+Summary: TODO: Package description
+Maintainer: user
+Maintainer-email: ricard.segura@udg.edu
+License: TODO: License declaration
+Provides-Extra: test

@@ -1,0 +1,18 @@
+{
+  "package_name": "stonefish_ros2",
+  "non_idl_tuples": [
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/Int32Stamped.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/BeaconInfo.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/NEDPose.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/INS.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/DVLBeam.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/DVL.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/ThrusterState.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/DebugPhysics.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/Event.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:msg/EventArray.msg",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:srv/SonarSettings.srv",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:srv/SonarSettings2.srv",
+    "/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/src/stonefish_ros2:srv/Respawn.srv"
+  ]
+}

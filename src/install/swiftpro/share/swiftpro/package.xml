@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>swiftpro</name>
+  <version>3.0.0</version>
+  <description>swiftpro contains the driver for the SwiftPro manipulator as well as ROS Control configuration files.</description>
+  <author>Patryk Cieslak</author>
+  <maintainer email="patryk.cieslak@udg.edu">Patryk Cieslak</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifcycle</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>hardware_interface</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
