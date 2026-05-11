@@ -96,12 +96,17 @@ ID_TEXT     = 5   # WHITE  text    — method name, error magnitude, and goal in
 # target_yaw = float('nan') -> position-only mode (3x4 Jacobian, q4 uncontrolled).
 # target_yaw = finite value  -> orientation mode  (4x4 Jacobian, yaw is controlled).
 GOAL_SEQUENCE = [
-    (np.array([-0.25,  0.00,  0.30]), float('nan')),  # position-only
-    (np.array([ 0.00, -0.25,  0.35]),  0.5),           # EE yaw = +0.5 rad (~29 deg)
-    (np.array([-0.15, -0.15,  0.28]), float('nan')),  # position-only
-    (np.array([ 0.10,  0.00,  0.40]), -0.5),           # EE yaw = -0.5 rad (~-29 deg)
-    (np.array([ 0.00, -0.25,  0.30]),  0.0),           # EE yaw =  0.0 rad (neutral)
-    (np.array([-0.20, -0.10,  0.36]),  1.0),           # EE yaw = +1.0 rad (~57 deg)
+    # (np.array([-0.25,  0.00,  0.30]), float('nan')),  # position-only
+    # (np.array([ 0.00, -0.25,  0.35]),  0.5),           # EE yaw = +0.5 rad (~29 deg)
+    # (np.array([-0.15, -0.15,  0.28]), float('nan')),  # position-only
+    # (np.array([ 0.10,  0.00,  0.40]), -0.5),           # EE yaw = -0.5 rad (~-29 deg)
+    # (np.array([ 0.00, -0.25,  0.30]),  0.0),           # EE yaw =  0.0 rad (neutral)
+    # (np.array([-0.20, -0.10,  0.36]),  1.0),           # EE yaw = +1.0 rad (~57 deg)
+    # ── drop_approach_target reachability test ────────────────────────────────
+    # Observed in pick-and-place log when robot base was at x=0.206, y=0.055.
+    # If the arm cannot converge here, the drop_point is outside its workspace
+    # from that base position and the robot must reposition before PLACE_APPROACH.
+    (np.array([-0.089, 0.025, 0.365]), float('nan')),  # drop_approach_target test
 ]
 
 # How long (seconds) the arm tries to reach each goal before cycling to the next

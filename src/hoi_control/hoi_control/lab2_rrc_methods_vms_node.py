@@ -14,6 +14,8 @@ import numpy as np
 from tf2_ros import Buffer, TransformListener, LookupException, \
     ConnectivityException, ExtrapolationException
 from hoi_control.swiftpro_robotics_rrc import (
+    SwiftProManipulator4DOF,      # 4-DOF arm state + kinematics queries
+    swiftpro_fk,                  # Arm-local FK: [q1, q2, q3] -> position relative to link1
     swiftpro_fk_vms_5dof,         # 5-DOF VMS FK: base (x,y,psi) + arm (q1,q2,q3)
     swiftpro_jacobian_vms_5dof,   # 5-DOF VMS Jacobian: 3x5 matrix (base + arm DOF)
     swiftpro_jacobian_vms_6dof,   # 6-DOF VMS Jacobian: 4x6 matrix (pos + yaw, includes q4)
