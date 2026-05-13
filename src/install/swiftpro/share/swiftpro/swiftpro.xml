@@ -1,9 +1,0 @@
-<library path="swiftpro">
-  <class name="swiftpro/SwiftProHardware"
-         type="swiftpro::SwiftProHardware"
-         base_class_type="hardware_interface::SystemInterface">
-    <description>
-      The ros2_control SwiftPro hardware interface.
-    </description>
-  </class>
-</library>

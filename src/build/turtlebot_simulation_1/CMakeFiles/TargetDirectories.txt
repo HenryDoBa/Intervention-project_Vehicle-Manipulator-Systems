@@ -1,9 +1,0 @@
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/uninstall.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/turtlebot_simulation_1_uninstall.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/test.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/edit_cache.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/rebuild_cache.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/list_install_components.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/install.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/install/local.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/turtlebot_simulation_1/CMakeFiles/install/strip.dir

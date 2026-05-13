@@ -1,9 +1,0 @@
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/uninstall.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/kobuki_description_uninstall.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/test.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/edit_cache.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/rebuild_cache.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/list_install_components.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/install.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/install/local.dir
-/home/huy/Desktop/Intervention-project_Vehicle-Manipulator-Systems-haadi_experimental/build/kobuki_description/CMakeFiles/install/strip.dir

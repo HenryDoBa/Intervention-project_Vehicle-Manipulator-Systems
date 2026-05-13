@@ -1,1 +1,0 @@
-rclcpp;rclcpp_lifcycle;ament_index_cpp;std_msgs;sensor_msgs;pluginlib;hardware_interface;ros2launch;controller_manager;robot_state_publisher;rosidl_default_runtime;xacro;ament_lint_auto;ament_lint_common
