@@ -7,23 +7,23 @@ import rclpy
 from rclpy.node import Node           
 from rclpy.parameter import Parameter 
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Float64
 from geometry_msgs.msg import Twist, Point
 from visualization_msgs.msg import Marker, MarkerArray
 import numpy as np
 from tf2_ros import Buffer, TransformListener, LookupException, \
     ConnectivityException, ExtrapolationException
 from hoi_control.swiftpro_robotics_rrc import (
-    SwiftProManipulator4DOF,      # 4-DOF arm state + kinematics queries
-    swiftpro_fk,                  # Arm-local FK: [q1, q2, q3] -> position relative to link1
+    # SwiftProManipulator4DOF,      # 4-DOF arm state + kinematics queries
+    # swiftpro_fk,                  # Arm-local FK: [q1, q2, q3] -> position relative to link1
     swiftpro_fk_vms_5dof,         # 5-DOF VMS FK: base (x,y,psi) + arm (q1,q2,q3)
     swiftpro_jacobian_vms_5dof,   # 5-DOF VMS Jacobian: 3x5 matrix (base + arm DOF)
     swiftpro_jacobian_vms_6dof,   # 6-DOF VMS Jacobian: 4x6 matrix (pos + yaw, includes q4)
-    # swiftpro_fk_vms_5dof_ned,     # FK variant for world_ned frame (not used in this node)
-    # swiftpro_jacobian_vms_5dof_ned, # Jacobian variant for world_ned frame (not used in this node)
-    # swiftpro_fk_vms_5dof_ned,     # 5-DOF VMS FK (world_ned → world_enu via TF) [USED]
-    # swiftpro_jacobian_vms_5dof_ned,   # 5-DOF VMS Jacobian (world_ned → world_enu via TF) [USED]
-    DLS,                          # Damped Least-Squares pseudo-inverse
+    # swiftpro_fk_vms_5dof_ned,     # FK variant for world_ned frame 
+    # swiftpro_jacobian_vms_5dof_ned, # Jacobian variant for world_ned frame 
+    # swiftpro_fk_vms_5dof_ned,     # 5-DOF VMS FK (world_ned -> world_enu via TF) 
+    # swiftpro_jacobian_vms_5dof_ned,   # 5-DOF VMS Jacobian (world_ned -> world_enu via TF) 
+    # DLS,                          # Damped Least-Squares pseudo-inverse
     scale_velocities,             # uniform velocity scaling to stay within max_vel
     Q1_MIN, Q1_MAX,               # joint1 base yaw URDF limits  (+-pi/2)
     Q2_MIN, Q2_MAX,               # joint2 shoulder URDF limits  (-pi/2, +0.05)
@@ -33,8 +33,10 @@ from hoi_control.swiftpro_robotics_rrc import (
     VMSRobotState,
     VMSPositionTask,
     VMSYawQ4Task,
-    VMSJointCenteringTask,
+    # VMSJointCenteringTask,
     VMSJointLimitsTask,
+    VMSJointPositionTask,
+    VMSBaseOrientationTask,
     vms_task_priority_step,
 )
 
@@ -81,25 +83,114 @@ ID_PATH_LINE = 6   # ORANGE line    — straight-line path from start to goal (f
 ID_PATH_WP   = 7   # ORANGE sphere  — current interpolated waypoint being tracked
 
 
-# Automatic goal cycling — DISTANT goals in world_enu (robot-relative, not arm-relative)
-# ---------------------------------------------------------------------------
-# Each goal is (position_world_enu, target_yaw).
-# target_yaw = float('nan') -> position-only  (3 X 5 Jacobian, q4 uncontrolled)
-# target_yaw = finite value  -> position+yaw  (4 X 6 Jacobian, q4 controlled)
-# Orient goals are split into 2 consecutive entries (position -> yaw)
-# so position and yaw control never interfere with each other, and q4 is clean
-# for the next goal. For orient goals (finite yaw), the code internally
-# runs two time-based sub-tasks sequentially: position -> yaw(q4).
-# Each sub-task runs for goal_cycle_period seconds. Position-only goals run
-# a single position task for one period.
+# Automatic goal cycling (robot-relative, not arm-relative)
+# GOAL_SEQUENCE is a flat list with two kinds of entries that can appear in any order:
+#
+#   Position entry  (original format, unchanged):
+#       (np.array([x, y, z]), yaw)
+#       yaw = float('nan') -> position-only sub-phase
+#       yaw = finite float -> position sub-phase then yaw sub-phase (decoupled)
+#
+#   Joint-position entry (one per joint, placed anywhere in the list):
+#       ('joint', arm_joint_idx, desired_angle_rad)
+#       arm_joint_idx : 0=q1, 1=q2, 2=q3, 3=q4
+#
+#   Base-orientation entry (one, placed anywhere in the list):
+#       ('base_yaw', desired_heading_rad)
+#       Controls base yaw (sigh) via the (omega) quasi-velocity DOF (index 1 in dzeta).
+#       Internally stored with key -1 in the same persistent dicts as joint tasks.
+#
+# Scanning rule (computed once at startup by _parse_goal_sequence):
+#   An entry that appears BEFORE its adjacent position entry -> ABOVE
+#     (higher priority than EE position — position acts in its null-space)
+#   An entry that appears AFTER  its adjacent position entry -> BELOW
+#     (lower priority — runs in null-space of EE position)
+#
+# Task hierarchy for the position sub-phase of each goal:
+#   joint_limits  >  joint tasks ABOVE  >  EE position  >  joint tasks BELOW
+#
+# Joint tasks are NOT applied during the yaw sub-phase (sub==1) — preserving
+# the position/yaw decoupling of configuration goals.
 GOAL_SEQUENCE = [
-    (np.array([ 1.20,  0.00,  0.30]), float('nan')),  # position-only
-    (np.array([ 0.00,  1.20,  0.35]),  0.5),           # orient: q4 yaw = +0.5 rad
-    (np.array([ 1.00,  0.60,  0.28]), float('nan')),  # position-only
-    (np.array([ 0.00, -1.20,  0.30]), -0.5),           # orient: q4 yaw = -0.5 rad
-    (np.array([ 0.80,  0.80,  0.36]),  0.0),           # orient: q4 yaw =  0.0 rad
-    (np.array([ 1.10, -0.40,  0.28]),  0.8),           # orient: q4 yaw = +0.8 rad
+    # Goal 0 — position-only, no joint tasks
+    # ('base_yaw', 0.0), # (sigh) -> 0.0 rad    [Below]
+    (np.array([ 1.20,  0.00,  0.30]), float('nan')),
+
+    # Goal 1 — q2 (shoulder) pinned ABOVE the position task
+    # Q2_MAX=0.05, margin=0.07 -> safe upper bound = 0.05−0.07×1.5 = −0.055
+    # ('joint', 1, -0.10),                                  # q2->-0.10  [ABOVE]
+    (np.array([ 0.00,  1.20,  0.35]),  0.5),              # orient goal
+
+    # Goal 2 — q1 biased BELOW position; base yaw biased toward 0.0 (face East) in null-space
+    (np.array([ 1.00,  0.60,  0.28]), float('nan')),      # position-only
+    # ('joint',    0,  0.3),                                # q1->0.3       [BELOW]
+                                       
+
+    # Goal 3 — orient, no joint tasks
+    (np.array([ 0.00, -1.20,  0.30]), -0.5),
+
+    # Goal 4 — q3 (elbow) fixed ABOVE position; q1 biased BELOW
+    # Q3_MAX=0.05, margin=0.07 -> safe upper bound = 0.05−0.07×1.5 = −0.055
+    # ('joint', 2, -0.10),                                  # q3->-0.10  [ABOVE]
+    (np.array([ 0.80,  0.80,  0.36]),  0.0),              # orient goal
+    ('joint', 0, 0.5),                                    # q1->0.5  [BELOW]
+
+    # Goal 5 — orient, no joint tasks
+    (np.array([ 1.10, -0.40,  0.28]),  0.8),
 ]
+
+
+def _parse_goal_sequence(seq):
+    """
+    Scan GOAL_SEQUENCE once at startup and return a list of parsed goal tuples:
+        (position, yaw, above_specs, below_specs)
+
+    position   : np.array([x, y, z])
+    yaw        : float or nan
+    above_specs: list of (idx, desired_angle) — tasks above EE position
+    below_specs: list of (idx, desired_angle) — tasks below EE position
+
+    idx encoding:
+       0-3  : arm joint index (q1-q4) from ('joint', idx, angle) entries
+        -1  : base orientation       from ('base_yaw', angle) entries
+
+    Algorithm:
+      1. Find indices of all position entries (first element is not a task tag).
+      2. For each position entry at flat index i (goal g):
+           above = task entries between (prev_pos_idx + 1) and i  (i exclusive)
+           below = task entries between i and (next_pos_idx)      (i exclusive)
+    """
+    _TASK_TAGS = ('joint', 'base_yaw') # Any tuple whose first element is one of these strings is a task, not a position goal.
+    is_pos = lambda e: not (isinstance(e[0], str) and e[0] in _TASK_TAGS)
+    pos_indices = [i for i, e in enumerate(seq) if is_pos(e)]
+
+    def _to_spec(e):
+        # For creating the data in a format that will help us to define the tasks
+        """Convert a task entry to (idx, angle)."""
+        if e[0] == 'joint':
+            return (e[1], e[2])    # (arm_joint_idx, desired_angle)
+        elif e[0] == 'base_yaw':
+            return (-1, e[1])      # (-1 = base orientation, desired_heading)
+
+    goals = []
+    for g, pi in enumerate(pos_indices):
+        position, yaw = seq[pi][0], seq[pi][1]
+
+        prev_pi = pos_indices[g - 1] if g > 0 else -1
+        next_pi = pos_indices[g + 1] if g < len(pos_indices) - 1 else len(seq)
+
+        above = [_to_spec(e) for e in seq[prev_pi + 1 : pi] if not is_pos(e)]
+        below = [_to_spec(e) for e in seq[pi + 1 : next_pi] if not is_pos(e)]
+
+        goals.append((position, yaw, above, below))
+        # For goal 4 which has both above and below:
+        # (np.array([0.80, 0.80, 0.36]),   # position
+            # 0.0,                            # yaw
+            # [(2, -0.10)],                   # above  — q3 pinned to -0.10
+            # [(0,  0.5)]                     # below  — q1 biased to 0.5
+            # )
+
+    return goals
 
 # How long (seconds) the arm tries to reach each goal before cycling to the next
 DEFAULT_GOAL_CYCLE_PERIOD = 60.0
@@ -118,10 +209,16 @@ class Lab2RRCMethodsVMSNode(Node):
 
         # Declare runtime-tunable parameters 
 
-        # Goal position in world_enu frame (East-North-Up, metres).
-        # Initialised from GOAL_SEQUENCE[0] so the first goal is active immediately
-        # without waiting for the first timer fire.
-        _g0_pos, _g0_yaw = GOAL_SEQUENCE[0]
+        # Parse the flat GOAL_SEQUENCE (which may contain 'joint' entries mixed with
+        # position entries) into a structured list of goal tuples once at startup.
+        # self._goals[g] = (position, yaw, above_specs, below_specs)
+        # _parse_goal_sequence skips 'joint' entries and finds the first actual
+        # position entry, so self._goals[0] is always a valid position goal.
+        self._goals = _parse_goal_sequence(GOAL_SEQUENCE)
+
+        # Goal position in world_enu frame.
+        # Use the first position entry from the parsed goals
+        _g0_pos, _g0_yaw = self._goals[0][0], self._goals[0][1]
         self.declare_parameter('target_x',   float(_g0_pos[0]))
         self.declare_parameter('target_y',   float(_g0_pos[1]))
         self.declare_parameter('target_z',   float(_g0_pos[2]))
@@ -132,11 +229,9 @@ class Lab2RRCMethodsVMSNode(Node):
         self.declare_parameter('target_yaw', float(_g0_yaw))
 
         # Proportional gain K for the position task: larger = faster convergence,
-        # but too large causes overshoot. Scaled by the identity matrix.
         self.declare_parameter('gain_k',    0.5)
 
-        # Proportional gain for the q4 yaw sub-task. Kept lower than gain_k
-        # because yaw correction is a secondary objective.
+        # Proportional gain for the q4 yaw sub-task. Kept lower than gain_k because yaw correction is a secondary objective.
         self.declare_parameter('yaw_gain_k', 0.3)
 
         # Maximum arm joint speed after uniform scaling (rad/s).
@@ -192,9 +287,22 @@ class Lab2RRCMethodsVMSNode(Node):
         self._pos_task  = VMSPositionTask('ee_position', np.zeros((3, 1)))
         self._yaw_task  = VMSYawQ4Task('ee_yaw_q4', 0.0)   # q4-only, zero position coupling
 
-        # Arm reset task: drives all arm joints [q1,q2,q3,q4] to 0 after each yaw phase.
-        self._q4_zero_task = VMSJointCenteringTask('arm_reset', [0.0, 0.05, 0.05, 0.0])
-        self._q4_zero_task.setGain(np.eye(4) * 0.8)
+        # Persistent joint-position task state — survives across goal transitions.
+        # Keyed by arm_joint_idx (0=q1 … 3=q4); value = desired angle (rad).
+        # New goals MERGE into these dicts (add / override); joints not mentioned
+        # in a new goal keep their previous desired angle and priority side.
+        # If a goal moves a joint from 'above' to 'below' (or vice versa), the
+        # old entry is removed from its previous side automatically.
+        self._persist_above: dict = {}   # {arm_joint_idx: desired_angle}
+        self._persist_below: dict = {}   # {arm_joint_idx: desired_angle}
+
+        # Cached VMSJointPositionTask lists rebuilt from the persistent dicts
+        # whenever the goal index changes.
+        self._joint_tasks_above: list = []
+        self._joint_tasks_below: list = []
+        self._cached_goal_idx = -1   # sentinel: forces rebuild on first tick
+        
+        # READ THE explanation_to_some_complex_ideas.txt TO UNDERSTAND THE ABOVE PERSISTENCE LOGIC AND GOAL SCANNING ALGORITHM — IT'S NOT OBVIOUS!
 
         # Guard flag: skip the control loop until the first /joint_states message
         # arrives so we never compute with stale zero-initialised joint angles
@@ -205,12 +313,12 @@ class Lab2RRCMethodsVMSNode(Node):
         self._base_x = 0.0       # robot base x position (East, m)
         self._base_y = 0.0       # robot base y position (North, m)
         self._base_psi = 0.0     # robot base yaw angle (rad)
-        self._omega_lpf = 0.0    # low-pass filter state for base angular velocity
+        # self._omega_lpf = 0.0    # low-pass filter state for base angular velocity
 
         # Initial base yaw — latched on first TF reading.
         # swiftpro_fk() is calibrated for the scenario's initial robot yaw.
         # delta_yaw = base_psi - initial_base_psi corrects for any base rotation.
-        self._initial_base_psi = None
+        # self._initial_base_psi = None   # no longer needed — FK uses q1_mod = q1-(ψ-π/2)
         
         # Cached arm link1 position in world_enu (used for FK offset)
         self._link1_world_enu = np.array([0.0, 0.0, 0.0])
@@ -228,14 +336,12 @@ class Lab2RRCMethodsVMSNode(Node):
         self._goal_idx = 0
 
         # A dedicated ROS timer fires _advance_goal() every DEFAULT_GOAL_CYCLE_PERIOD
-        # seconds, independently of the control-loop rate.  Using a separate timer
-        # (rather than counting control-loop ticks) means the goal period is accurate
-        # even if the control loop occasionally misses a tick.
+        # seconds, independently of the control-loop rate.  
         self._goal_cycle_timer = self.create_timer(DEFAULT_GOAL_CYCLE_PERIOD, self._advance_goal)
 
         # Sub-task index within the current goal (time-based, timer-driven).
         # Position-only goals have 1 sub-task (index 0 only).
-        # Orient goals have 3 sub-tasks: 0=position, 1=yaw(q4).
+        # Orient goals have 2 sub-tasks: 0=position, 1=yaw(q4).
         self._sub_phase_idx = 0
 
         # Straight-line path tracking for the position sub-task.
@@ -268,6 +374,25 @@ class Lab2RRCMethodsVMSNode(Node):
         # Publisher for RViz debug markers (spheres, lines, text)
         self.pub_markers = self.create_publisher(MarkerArray, MARKER_TOPIC, 10)
 
+        # Publishers for joint angles (PlotJuggler visualization)
+        self.pub_q1 = self.create_publisher(Float64, '/hoi/joint_angle_q1', 10)
+        self.pub_q2 = self.create_publisher(Float64, '/hoi/joint_angle_q2', 10)
+        self.pub_q3 = self.create_publisher(Float64, '/hoi/joint_angle_q3', 10)
+        self.pub_q4 = self.create_publisher(Float64, '/hoi/joint_angle_q4', 10)
+
+        # Publishers for joint limit status (1 = active, 0 = inactive)
+        self.pub_q1_limit = self.create_publisher(Float64, '/hoi/joint_limit_q1', 10)
+        self.pub_q2_limit = self.create_publisher(Float64, '/hoi/joint_limit_q2', 10)
+        self.pub_q3_limit = self.create_publisher(Float64, '/hoi/joint_limit_q3', 10)
+        self.pub_q4_limit = self.create_publisher(Float64, '/hoi/joint_limit_q4', 10)
+
+        # Publishers for task error norms (PlotJuggler visualization)
+        self.pub_err_to_goal = self.create_publisher(Float64, '/hoi/err_to_goal', 10)
+        self.pub_err_to_wp   = self.create_publisher(Float64, '/hoi/err_to_waypoint', 10)
+
+        # Publisher for base yaw (PlotJuggler visualization)
+        self.pub_base_yaw = self.create_publisher(Float64, '/hoi/base_yaw', 10)
+        
         # Main control timer: fires _control_loop at exactly 60 Hz (every DT seconds)
         self.timer = self.create_timer(DT, self._control_loop)
 
@@ -284,12 +409,65 @@ class Lab2RRCMethodsVMSNode(Node):
         self.get_logger().info('RViz:  Fixed Frame=world_enu  '
                                'MarkerArray from ' + MARKER_TOPIC)
         self.get_logger().info(
-            f'Goals: {len(GOAL_SEQUENCE)} DISTANT targets in world_enu, cycling every '
+            f'Goals: {len(self._goals)} DISTANT targets in world_enu, cycling every '
             f'{DEFAULT_GOAL_CYCLE_PERIOD:.0f} s  (goal_auto_cycle=True)')
         self.get_logger().info('FK/Jacobian: Arm-local (proven), errors in world_enu frame')
         self.get_logger().info('Method: DLS (default=2), World EE = J1_world + FK_arm_local')
         self.get_logger().info('Base moves when error > error_threshold using base_linear_max')
         self.get_logger().info('=' * 62)
+
+    # Joint task cache 
+
+    def _build_joint_tasks(self, goal_idx):
+        """
+        Merge this goal's joint-position specs into the persistent dicts and
+        rebuild the VMSJointPositionTask lists.  Called only on goal change.
+
+        Persistence rule:
+          • Joints defined in this goal are added / updated in the persistent dict.
+          • If a joint switches sides (above <--> below), it is removed from the old side.
+          • Joints NOT mentioned in this goal keep their previous desired angle and side.
+
+        This means a joint task introduced in goal N continues to apply in goals
+        N+1, N+2, ... (with its last desired angle) until a later goal explicitly
+        changes or cancels it.
+        """
+        _, _, above_specs, below_specs = self._goals[goal_idx]
+
+        # Merge 'above' specs — remove from below if switching sides
+        for qi, angle in above_specs:
+            self._persist_below.pop(qi, None)
+            self._persist_above[qi] = angle
+
+        # Merge 'below' specs — remove from above if switching sides
+        for qi, angle in below_specs:
+            self._persist_above.pop(qi, None)
+            self._persist_below[qi] = angle
+
+        # Rebuild task objects from the now-updated persistent dicts.
+        # idx == -1  -> VMSBaseOrientationTask (controls base (sigh) via (omega) DOF)
+        # idx == 0-3 -> VMSJointPositionTask   (controls arm joint q_{idx+1})
+        def _make_task(side, qi, angle):
+            if qi == -1:
+                return VMSBaseOrientationTask(f'base_yaw_{side}', angle)
+            return VMSJointPositionTask(f'jp_{side}_q{qi+1}', angle, qi)
+
+        def _label(qi, angle):
+            return f'(sigh)->{angle:.3f}rad' if qi == -1 else f'q{qi+1}→{angle:.3f}rad'
+
+        self._joint_tasks_above = [
+            _make_task('above', qi, angle) for qi, angle in self._persist_above.items()
+        ]
+        self._joint_tasks_below = [
+            _make_task('below', qi, angle) for qi, angle in self._persist_below.items()
+        ]
+        self._cached_goal_idx = goal_idx
+
+        above_str = [_label(qi, a) for qi, a in self._persist_above.items()]
+        below_str = [_label(qi, a) for qi, a in self._persist_below.items()]
+        self.get_logger().info(
+            f'[JOINT TASKS] goal {goal_idx} — persistent state: '
+            f'above={above_str}  below={below_str}')
 
     # Callbacks
     def _js_cb(self, msg: JointState):
@@ -342,7 +520,6 @@ class Lab2RRCMethodsVMSNode(Node):
         # Re-read the period in case it was changed at runtime via ros2 param set.
         # timer_period_ns is the period this timer was created with (nanoseconds).
         period = float(self.get_parameter('goal_cycle_period').value)
-        # TODO What is the purpose of this line of code? Why do we need to re-read the period?
         if abs(self._goal_cycle_timer.timer_period_ns / 1e9 - period) > 0.5:
             # Period was changed by more than 0.5 s — recreate the timer.
             # ROS 2 timers cannot be reconfigured after creation, so we destroy
@@ -351,8 +528,7 @@ class Lab2RRCMethodsVMSNode(Node):
             self._goal_cycle_timer = self.create_timer(period, self._advance_goal)
 
         # Current goal determines how many sub-tasks exist.
-        goal_pos, goal_yaw = GOAL_SEQUENCE[self._goal_idx]
-        # num_phases = 3 if math.isfinite(goal_yaw) else 1   # 3 = position + yaw + arm_reset
+        goal_pos, goal_yaw = self._goals[self._goal_idx][0], self._goals[self._goal_idx][1]
         num_phases = 2 if math.isfinite(goal_yaw) else 1     # 2 = position + yaw (no reset)
 
         # Advance sub-task first; only move to the next goal when all sub-tasks done.
@@ -361,8 +537,8 @@ class Lab2RRCMethodsVMSNode(Node):
         self._path_start   = self._last_tf_ee.copy() if self._last_tf_ee is not None else None
         self._path_start_t = self.get_clock().now()
         if self._sub_phase_idx < num_phases:
-            sub_names = ['position', 'yaw/q4', 'q4_reset']
-            msg = (f'[GOAL CYCLE] -> goal {self._goal_idx}/{len(GOAL_SEQUENCE)-1} '
+            sub_names = ['position', 'yaw/q4']
+            msg = (f'[GOAL CYCLE] -> goal {self._goal_idx}/{len(self._goals)-1} '
                    f'sub-task {self._sub_phase_idx}: {sub_names[self._sub_phase_idx]}')
             self.get_logger().info(msg)
             self._log_entries.append(msg)
@@ -370,9 +546,9 @@ class Lab2RRCMethodsVMSNode(Node):
 
         # All sub-tasks done — advance to next goal and reset sub-task index.
         self._sub_phase_idx = 0
-        self._goal_idx = (self._goal_idx + 1) % len(GOAL_SEQUENCE)
+        self._goal_idx = (self._goal_idx + 1) % len(self._goals)
 
-        goal_pos, goal_yaw = GOAL_SEQUENCE[self._goal_idx]
+        goal_pos, goal_yaw = self._goals[self._goal_idx][0], self._goals[self._goal_idx][1]
 
         # Write the new target back into the ROS parameter server.
         self.set_parameters([
@@ -384,7 +560,7 @@ class Lab2RRCMethodsVMSNode(Node):
 
         yaw_str = f'{goal_yaw:.2f} rad ({math.degrees(goal_yaw):.1f} deg)' \
                   if math.isfinite(goal_yaw) else 'position-only'
-        msg = (f'[GOAL CYCLE] -> goal {self._goal_idx}/{len(GOAL_SEQUENCE)-1}: '
+        msg = (f'[GOAL CYCLE] -> goal {self._goal_idx}/{len(self._goals)-1}: '
                f'[{goal_pos[0]:.3f}, {goal_pos[1]:.3f}, {goal_pos[2]:.3f}] world_enu  '
                f'yaw={yaw_str}')
         self.get_logger().info(msg)
@@ -392,8 +568,6 @@ class Lab2RRCMethodsVMSNode(Node):
 
     def _control_loop(self):
         # Block until the first /joint_states message has been received.
-        # Without this guard the FK and Jacobian would run on q = [0,0,0,0],
-        # which is a singular configuration for some arm poses.
         if not self._got_js:
             return
 
@@ -419,7 +593,6 @@ class Lab2RRCMethodsVMSNode(Node):
         target_world_enu = np.array([tx, ty, tz])
 
         # Convert the integer method selector to a human-readable label for logging
-        # mth % 3 ensures any integer input maps into the valid range 0-2
         method_name = ['transpose', 'pseudoinverse', 'DLS'][mth % 3]
 
         # Orientation mode is active when target_yaw is a real number (not NaN).
@@ -437,10 +610,10 @@ class Lab2RRCMethodsVMSNode(Node):
 
         # Latch initial base yaw on first valid TF reading.
         # delta_yaw corrects for any base rotation since then.
-        if self._initial_base_psi is None and base_pose is not None:
-            self._initial_base_psi = self._base_psi
-            self.get_logger().info(
-                f'Initial base yaw latched: {self._initial_base_psi:.4f} rad')
+        # if self._initial_base_psi is None and base_pose is not None:
+        #     self._initial_base_psi = self._base_psi
+        #     self.get_logger().info(
+        #         f'Initial base yaw latched: {self._initial_base_psi:.4f} rad')
 
         if link1_world_enu is not None:
             self._link1_world_enu = link1_world_enu
@@ -449,9 +622,6 @@ class Lab2RRCMethodsVMSNode(Node):
             self._last_tf_ee = ee_world_enu
 
         # 5-DOF VMS FK 
-        # swiftpro_fk_vms_5dof(j1_world, arm_q, base_yaw):
-        #   substitutes q1_mod = q1 − (ψ − π/2) so swiftpro_fk is correct at
-        #   any base yaw, with no rotation matrix needed.
         q_arm = np.array(self._vms_state.arm_q)   # [q1, q2, q3, q4] — full 4-DOF
         fk_world_enu = swiftpro_fk_vms_5dof(
             self._link1_world_enu, q_arm, self._base_psi, self._tf_buffer)
@@ -505,11 +675,18 @@ class Lab2RRCMethodsVMSNode(Node):
             tasks = self._joint_limit_tasks + [self._yaw_task]
         else:
             # Position task — straight-line path from start to goal.
-            # Latch the start on the very first tick of this sub-task.
+            # Latch the start only when TF EE is available.
+            # Do NOT fall back to fk_world_enu: at startup self._link1_world_enu
+            # is still [0,0,0] (TF not yet received), so fk_world_enu is wrong
+            # and would anchor the orange path line near the floor.
+            # Instead, skip this tick entirely until TF arrives.
             if self._path_start is None:
-                self._path_start   = (ee_world_enu.copy() if ee_world_enu is not None
-                                       else fk_world_enu.copy())
-                self._path_start_t = self.get_clock().now()
+                if ee_world_enu is not None:
+                    self._path_start   = ee_world_enu.copy()
+                    self._path_start_t = self.get_clock().now()
+                else:
+                    # TF not ready yet — do nothing this tick.
+                    return
 
             elapsed = (self.get_clock().now() - self._path_start_t).nanoseconds / 1e9
             period  = float(self.get_parameter('goal_cycle_period').value)
@@ -518,9 +695,9 @@ class Lab2RRCMethodsVMSNode(Node):
             # Interpolated waypoint along the straight line: start -> goal.
             path_desired = self._path_start + path_alpha * (target_world_enu - self._path_start)
 
-            # Feedforward velocity = σ̇_E (velocity of the moving desired point).
-            # From the RRC control law:  ẋ_E = σ̇_E + K·σ̃_E
-            # σ̇_E = (goal - start) / T  — constant along the straight-line path.
+            # Feedforward velocity = sigma_dot_E (velocity of the moving desired point).
+            # From the RRC control law:  x_dot_E = sigma_dot_E + K*sigma_~_E
+            # sigma_dot_E = (goal - start) / T  — constant along the straight-line path.
             # Without this term the controller always lags behind the moving waypoint.
             # Zero the feedforward once the path is complete (alpha=1) so the
             # feedback term alone handles the final convergence to the fixed goal.
@@ -532,7 +709,17 @@ class Lab2RRCMethodsVMSNode(Node):
             self._pos_task.setDesired(path_desired.reshape(3, 1))
             self._pos_task.setGain(np.diag([K_gain] * 3))
             self._pos_task.setFF(ff_vel.reshape(3, 1))
-            tasks = self._joint_limit_tasks + [self._pos_task]
+
+            # Rebuild joint-position task objects only when goal changes.
+            if self._goal_idx != self._cached_goal_idx:
+                self._build_joint_tasks(self._goal_idx)
+
+            # Task hierarchy (position sub-phase):
+            #   joint_limits  >  joint tasks ABOVE  >  EE position  >  joint tasks BELOW
+            tasks = (self._joint_limit_tasks
+                     + self._joint_tasks_above
+                     + [self._pos_task]
+                     + self._joint_tasks_below)
 
         # Run one step of the recursive Task-Priority algorithm.
         if ena:
@@ -549,10 +736,17 @@ class Lab2RRCMethodsVMSNode(Node):
             J_cond  = float(np.linalg.cond(self._yaw_task.getJacobian()))
         else:
             self._pos_task.update(self._vms_state)
-            pos_err = self._pos_task.getError()
+            pos_err = self._pos_task.getError()   # error to moving waypoint (used by controller)
             yaw_err = float('nan')
             J_cond  = float(np.linalg.cond(self._pos_task.getJacobian()))
+
+        # err_norm to waypoint (internal, used by controller)
         err_norm = float(np.linalg.norm(pos_err))
+
+        # display_err_norm — distance from EE to the FINAL target (not the moving waypoint).
+        # always sees how far the EE is from the actual goal, not from the interpolated point.
+        _ee_now = ee_world_enu if ee_world_enu is not None else fk_world_enu
+        display_err_norm = float(np.linalg.norm(target_world_enu - _ee_now))
 
         # Active joint-limit status for log
         active_limits = [t.name for t in self._joint_limit_tasks if t.isActive()]
@@ -615,8 +809,9 @@ class Lab2RRCMethodsVMSNode(Node):
                     orient_status = 'converging...'
                 orient_lines = (
                     f'  yaw target  : {t_yaw:.3f} rad  ({math.degrees(t_yaw):.1f} deg)\n'
-                    f'  EE yaw      : {self._base_psi + q[0] + q[3]:.3f} rad  '
-                    f'(psi={self._base_psi:.3f} + q1={q[0]:.3f} + q4={q[3]:.3f})\n'
+                    # f'  EE yaw      : {self._base_psi + q[0] + q[3]:.3f} rad  '
+                    # f'(psi={self._base_psi:.3f} + q1={q[0]:.3f} + q4={q[3]:.3f})\n'
+                    f'  EE yaw      : {q[3]:.3f} rad  (q4 only)\n'
                     f'  yaw_err     : {math.degrees(yaw_err):.2f} deg  ({yaw_err:.4f} rad)\n'
                     f'  orient status: {orient_status}\n'
                 )
@@ -626,7 +821,7 @@ class Lab2RRCMethodsVMSNode(Node):
             log_str = (
                 f'\n{"─"*70}\n'
                 f'  solver      : task-priority | method: {method_name}  |  enabled: {ena}  |  mode: {mode_str}\n'
-                f'  goal_idx    : {self._goal_idx}/{len(GOAL_SEQUENCE)-1}\n'
+                f'  goal_idx    : {self._goal_idx}/{len(self._goals)-1}\n'
                 f'  BASE POSE   : x={self._base_x:.3f}  y={self._base_y:.3f}  '
                 f'psi={self._base_psi:.3f}\n'
                 f'  ARM q[1-4]  : [{q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f}] rad\n'
@@ -635,7 +830,8 @@ class Lab2RRCMethodsVMSNode(Node):
                 f'  FK EE(wenu) : {np.round(fk_world_enu,3)}\n'
                 f'  FK_vs_TF    : {fk_vs_tf_mm:.3f} mm\n'
                 f'  pos_source  : {position_source}\n'
-                f'  err_norm    : {err_norm:.4f} m\n'
+                f'  err_to_goal : {display_err_norm:.4f} m  (EE -> final target)\n'
+                f'  err_to_wp   : {err_norm:.4f} m  (EE -> moving waypoint)\n'
                 f'  err_vec     : {np.round(pos_err.flatten(),4)}\n'
                 f'  path_alpha  : {path_alpha:.3f}  '
                 f'(waypoint {np.round(path_desired,3) if sub == 0 or not orient_mode else np.round(target_world_enu,3)})\n'
@@ -653,8 +849,60 @@ class Lab2RRCMethodsVMSNode(Node):
         # Markers
         self._publish_markers(
             target_world_enu, ee_world_enu, fk_world_enu,
-            np.array([self._base_x, self._base_y, 0.0]), err_norm, method_name, yaw_err,
+            np.array([self._base_x, self._base_y, 0.0]), display_err_norm, method_name, yaw_err,
             path_start=self._path_start, path_desired=path_desired)
+        # Publish joint angles, limit status, and error norms for PlotJuggler visualization
+        self._publish_joint_data(q_arm, display_err_norm, err_norm)
+    # Joint data publisher
+
+    def _publish_joint_data(self, q_arm, err_to_goal=float('nan'), err_to_waypoint=float('nan')):
+        """
+        Publish joint angles, joint limit status, and task error norms for PlotJuggler.
+
+        Topics
+        ------
+        /hoi/joint_angle_q{1-4}   : current arm joint angles (rad)
+        /hoi/joint_limit_q{1-4}   : 1.0 if limit task active, 0.0 otherwise
+        /hoi/err_to_goal          : EE distance to final target (m)
+        /hoi/err_to_waypoint      : EE distance to moving interpolated waypoint (m)
+        """
+        # Extract individual joint angles
+        q1, q2, q3, q4 = q_arm[0], q_arm[1], q_arm[2], q_arm[3]
+        
+        # Publish joint angles
+        msg_q1 = Float64(data=float(q1))
+        msg_q2 = Float64(data=float(q2))
+        msg_q3 = Float64(data=float(q3))
+        msg_q4 = Float64(data=float(q4))
+        
+        self.pub_q1.publish(msg_q1)
+        self.pub_q2.publish(msg_q2)
+        self.pub_q3.publish(msg_q3)
+        self.pub_q4.publish(msg_q4)
+        
+        # Publish joint limit status (1 = active, 0 = inactive)
+        # Check each joint limit task to see if it's active
+        q1_limit_status = 1.0 if self._joint_limit_tasks[0].isActive() else 0.0
+        q2_limit_status = 1.0 if self._joint_limit_tasks[1].isActive() else 0.0
+        q3_limit_status = 1.0 if self._joint_limit_tasks[2].isActive() else 0.0
+        q4_limit_status = 1.0 if self._joint_limit_tasks[3].isActive() else 0.0
+        
+        msg_q1_limit = Float64(data=q1_limit_status)
+        msg_q2_limit = Float64(data=q2_limit_status)
+        msg_q3_limit = Float64(data=q3_limit_status)
+        msg_q4_limit = Float64(data=q4_limit_status)
+        
+        self.pub_q1_limit.publish(msg_q1_limit)
+        self.pub_q2_limit.publish(msg_q2_limit)
+        self.pub_q3_limit.publish(msg_q3_limit)
+        self.pub_q4_limit.publish(msg_q4_limit)
+
+        # Publish error norms
+        self.pub_err_to_goal.publish(Float64(data=float(err_to_goal)))
+        self.pub_err_to_wp.publish(Float64(data=float(err_to_waypoint)))
+
+        # Publish base yaw
+        self.pub_base_yaw.publish(Float64(data=float(self._base_psi)))
 
     # Marker publisher 
 

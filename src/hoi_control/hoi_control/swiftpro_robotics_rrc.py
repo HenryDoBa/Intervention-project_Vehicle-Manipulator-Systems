@@ -654,7 +654,8 @@ class VMSRobotState:
         return self.ee_world.copy()
 
     def getEEYaw(self):
-        return self.base_psi + self.arm_q[0] + self.arm_q[3]
+        # return self.base_psi + self.arm_q[0] + self.arm_q[3]
+        return self.arm_q[3]
 
     def getEEJacobian(self):
         """3×6 position Jacobian — top 3 rows of the full 4×6 Jacobian."""
@@ -766,6 +767,7 @@ class VMSConfigurationTask(Task):
 
         self.err = np.vstack([pos_err, [[raw_yaw_err]]])
         self.J   = state.getFullJacobian()   # 4×6
+
 
 
 class VMSJointLimitsTask(Task):
@@ -900,6 +902,97 @@ class VMSYawQ4Task(Task):
         raw_err = (raw_err + np.pi) % (2 * np.pi) - np.pi
         self.err = np.array([[raw_err]])
         # Jacobian is constant — only q4
+
+
+class VMSJointPositionTask(Task):
+    """
+    Joint-space position task for a single arm joint in the 6-DOF VMS.
+    Jacobian: 1×6 row with a single 1.0 at the joint's quasi-velocity column.
+    desired: scalar joint angle (rad)
+    arm_joint_idx: 0=q1, 1=q2, 2=q3, 3=q4  (maps to zeta cols 2–5)
+    """
+    def __init__(self, name, desired_angle, arm_joint_idx):
+        super().__init__(name, np.array([[float(desired_angle)]]))
+        self.joint_idx = arm_joint_idx + 2   # zeta col: q1→2, q2→3, q3→4, q4→5
+        self.J   = np.zeros((1, 6))
+        self.J[0, self.joint_idx] = 1.0      # single-entry row Jacobian
+        self.err = np.zeros((1, 1))
+
+    def update(self, state):
+        current_q = state.getJointPos(self.joint_idx)
+        self.err  = self.sigma_d - np.array([[current_q]])
+
+
+class VMSBaseOrientationTask(Task):
+    """
+    Base yaw (heading) task for the 6-DOF VMS.
+
+    Drives the robot base to a desired heading angle ψ_d by commanding the
+    angular quasi-velocity ω (index 1 in the 6-DOF dzeta vector).
+
+    σ   = ψ  (base yaw in world_enu, rad)
+    J   = [0, 1, 0, 0, 0, 0]  — only ω contributes to ψ̇
+    err = wrap(ψ_d − ψ_current)  (wrapped to [-π, π] to take the short arc)
+
+    Use this as a high-priority task before a position task when the robot
+    needs to face a specific direction first, or as a null-space task to
+    maintain a preferred heading while the EE tracks a goal.
+
+    Parameters
+    ----------
+    name         : task label (string)
+    desired_yaw  : target base heading (rad)
+    """
+    def __init__(self, name, desired_yaw=0.0):
+        super().__init__(name, np.array([[float(desired_yaw)]]))
+        self.J   = np.zeros((1, 6))
+        self.J[0, 1] = 1.0   # index 1 = ω (base angular quasi-velocity)
+        self.err = np.zeros((1, 1))
+
+    def update(self, state):
+        raw_err = float(self.sigma_d[0, 0]) - state.base_psi
+        raw_err = (raw_err + np.pi) % (2 * np.pi) - np.pi   # wrap to [-π, π]
+        self.err = np.array([[raw_err]])
+        # Jacobian is constant — ω is the only DOF that changes ψ
+
+
+class ArmJointPositionTask(Task):
+    """
+    Joint-space position task for a single arm joint — ARM-ONLY (base fixed).
+
+    Designed to work with SwiftProManipulator4DOF (and any object with a .q
+    array of shape (4,)).  The Jacobian is 1×4 so it plugs into a 4-DOF
+    arm-only solver, NOT the 6-DOF VMS solver.
+
+    For the VMS equivalent use VMSJointPositionTask (1×6 Jacobian).
+
+    Mirrors the JointPosition task from lab4_robotics.py, adapted for the
+    uArm Swift Pro joint naming.
+
+    σ   = q_i  (arm joint angle, rad)
+    J   = [0, …, 1, …, 0]  — 1×4 row with 1.0 at arm_joint_idx
+    err = q_i_desired − q_i_current
+
+    Parameters
+    ----------
+    name           : task label (string)
+    desired_angle  : target joint angle (rad)
+    arm_joint_idx  : 0=q1, 1=q2, 2=q3, 3=q4
+    """
+    def __init__(self, name, desired_angle, arm_joint_idx):
+        super().__init__(name, np.array([[float(desired_angle)]]))
+        self.arm_joint_idx = arm_joint_idx
+        self.J   = np.zeros((1, 4))
+        self.J[0, arm_joint_idx] = 1.0   # single-entry row Jacobian (1×4)
+        self.err = np.zeros((1, 1))
+
+    def update(self, arm):
+        """
+        arm : SwiftProManipulator4DOF  (must have .q array of shape (4,))
+        """
+        current_q = float(arm.q[self.arm_joint_idx])
+        self.err  = self.sigma_d - np.array([[current_q]])
+        # Jacobian is constant — does not change with configuration
 
 
 # ---------------------------------------------------------------------------

@@ -497,11 +497,9 @@ class PickPlaceVMSNode(Node):
                          f'{math.hypot(self._align_target_world[0] - self._base_x, self._align_target_world[1] - self._base_y):.2f}m'
                          if self._align_target_world is not None else 'ALIGN_DIST')
             else:
-                all_ok = (abs(face_ov) < ALIGN_ANGLE_TOL and
-                          abs(centre_ov) < ALIGN_ANGLE_TOL)
-                color  = (0, 255, 0) if all_ok else (0, 165, 255)
-                label  = (f'face={math.degrees(face_ov):+.1f}deg  '
-                          f'ctr={math.degrees(centre_ov):+.1f}deg  '
+                color  = (0, 255, 0) if abs(centre_ov) < ALIGN_ANGLE_TOL else (0, 165, 255)
+                label  = (f'ctr={math.degrees(centre_ov):+.1f}deg  '
+                          f'face={math.degrees(face_ov):+.1f}deg  '
                           f'dist={d_ov:.3f}m')
             cv2.putText(annotated, label,
                         (cx_img - 420, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -815,25 +813,26 @@ class PickPlaceVMSNode(Node):
             R, _         = cv2.Rodrigues(self._marker_rvec)
             mz           = R @ np.array([0.0, 0.0, 1.0])
             center_angle = math.atan2(float(tv[0]), float(tv[2]))
-            face_angle   = math.atan2(float(mz[0]), -float(mz[2]))
+            face_angle   = math.atan2(float(mz[0]), -float(mz[2]))  # logged only
 
             self.get_logger().info(
-                f'ALIGN_ANGLE: face={math.degrees(face_angle):+.1f}° '
-                f'ctr={math.degrees(center_angle):+.1f}° '
+                f'ALIGN_ANGLE: ctr={math.degrees(center_angle):+.1f}° '
+                f'face={math.degrees(face_angle):+.1f}° '
                 f'tol={math.degrees(ALIGN_ANGLE_TOL):.1f}°',
                 throttle_duration_sec=0.5)
 
-            if (abs(face_angle) < ALIGN_ANGLE_TOL and
-                    abs(center_angle) < ALIGN_ANGLE_TOL):
+            if abs(center_angle) < ALIGN_ANGLE_TOL:
                 self.get_logger().info(
-                    f'Face-on (face={math.degrees(face_angle):+.1f}° '
-                    f'ctr={math.degrees(center_angle):+.1f}°) → APPROACH_BOX_VMS')
+                    f'Centered (ctr={math.degrees(center_angle):+.1f}° '
+                    f'face={math.degrees(face_angle):+.1f}°) → APPROACH_BOX_VMS')
                 self._send_base(0.0, 0.0)
                 self._transition(State.APPROACH_BOX_VMS)
                 return
 
+            # Drive omega from center_angle only — face_angle excluded because
+            # at the stand-off point the two terms have opposite signs and cancel.
             omega = float(np.clip(
-                -ALIGN_K_CENTER * center_angle - ALIGN_K_ANGLE * face_angle,
+                -ALIGN_K_CENTER * center_angle,
                 -ALIGN_MAX_OMEGA, ALIGN_MAX_OMEGA))
             self._send_base(0.0, omega)
             self._send_arm(np.zeros(4))
