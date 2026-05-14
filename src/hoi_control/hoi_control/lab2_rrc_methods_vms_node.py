@@ -288,7 +288,7 @@ class Lab2RRCMethodsVMSNode(Node):
         self._yaw_task  = VMSYawQ4Task('ee_yaw_q4', 0.0)   # q4-only, zero position coupling
 
         # Persistent joint-position task state — survives across goal transitions.
-        # Keyed by arm_joint_idx (0=q1 … 3=q4); value = desired angle (rad).
+        # Keyed by arm_joint_idx (0=q1 .. 3=q4); value = desired angle (rad).
         # New goals MERGE into these dicts (add / override); joints not mentioned
         # in a new goal keep their previous desired angle and priority side.
         # If a goal moves a joint from 'above' to 'below' (or vice versa), the
@@ -478,6 +478,7 @@ class Lab2RRCMethodsVMSNode(Node):
         # loop blocks until this is True
         self._got_js = True
 
+    # For robot ee
     def _tf_pos(self, child_frame):
         """Look up position of child_frame in world_enu. Returns (3,) or None."""
         try:
@@ -488,6 +489,7 @@ class Lab2RRCMethodsVMSNode(Node):
         except (LookupException, ConnectivityException, ExtrapolationException):
             return None
     
+    # For mobile base pose (x, y, yaw)
     def _tf_pose(self, frame_id):
         """Look up pose (position + yaw) of frame_id in world_enu. Returns [x, y, psi] or None."""
         try:
